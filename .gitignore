@@ -1,6 +1,15 @@
 # Local research workspace (never published)
 research/
 
+# Compatibility shims for the local research workspace (never published)
+/data
+/plans
+/figures
+/jit
+/core.py
+/tree.py
+/freq.py
+
 # Data and experiment artifacts
 data/
 plans/
