@@ -1,0 +1,14 @@
+# DraftSlice example configuration (pre-alpha; keys are placeholders).
+
+[engine]
+name = "vllm"
+model = "Qwen/Qwen3.5-4B"
+drafter = "eagle3"
+
+[draftslice]
+# Plan/row cache budget in MiB.
+plan_cache_mb = 64
+# Fallback for free-form or large-valid-set states: "full", "slimspec", "static".
+fallback = "full"
+# Optional per-step latency budget for deadline-aware drafting, in milliseconds.
+# deadline_ms = 100
