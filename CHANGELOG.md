@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- Add M5 screener tooling: `screen.router` trains an MLP group router from
+  teacher logits or observed tokens; `screen.artifacts` serializes
+  full/static/group/router/low-rank screeners into verified `screener/1`
+  bundles; `draftslice screen train-router` builds a router artifact from a
+  torch training file; and `compile_screened` caches plans by the exact
+  candidate tuple, delta, universe, calibration id, budget, and layout.
+- Add the vLLM artifact/free-form screener path:
+  `DRAFTSLICE_VLLM_SCREENER_ARTIFACT` loads a verified bundle and records its
+  calibration id/delta, and `DRAFTSLICE_VLLM_SCREENER_UNIVERSE=vocab` screens
+  free-form rows while still intersecting rows that have a grammar state.
+- Add `bench.factorial` and `draftslice bench factorial` for a screener x
+  workload matrix with exact top-k coverage, mean candidate count, and
+  candidate bytes per cell.
+- Add M6 release tooling: `bench.release` hashes result files, writes a
+  self-describing manifest, renders Markdown for every implemented schema, and
+  supports B5 release comparison; CLI `bench report`, `bench validate`, and
+  `bench compare`. Add nightly/release workflows and an engine-free smoke
+  pipeline.
+- Add the SGLang boundary (`integrations/sglang.py`): a tested candidate
+  transform and guarded registration. The engine hook is not validated because
+  the reference SGLang install is missing `sgl_kernel`.
 - Add an opt-in vLLM screener hook. `DRAFTSLICE_VLLM_SCREENER` names a
   `screen.registry` source and `DRAFTSLICE_VLLM_SCREENER_ARGS` supplies its JSON
   kwargs; the adapter intersects candidates with the exact worker-side grammar

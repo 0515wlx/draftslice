@@ -1,0 +1,33 @@
+name: Nightly
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  offline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install
+        run: python -m pip install -e ".[bench]"
+      - name: Lint
+        run: ruff check .
+      - name: Test
+        run: pytest -q
+      - name: Screener/release smoke pipeline
+        run: python benchmarks/smoke_pipeline.py --out-dir runs/smoke-pipeline
+      - name: Validate release manifest
+        run: draftslice bench validate --manifest runs/smoke-pipeline/report.manifest.json
+      - name: Upload smoke report
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-pipeline
+          path: runs/smoke-pipeline/

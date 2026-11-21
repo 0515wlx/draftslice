@@ -168,3 +168,28 @@ def test_compile_screened_rejects_bad_rows_and_universe() -> None:
         compiler.compile_screened([state()], [TokenSet((1,))], delta=0.05, universe="bad")
     with pytest.raises(TypeError):
         compiler.compile_screened([state()], [("not-a-token-set",)], delta=0.05)  # type: ignore[list-item]
+
+
+def test_compile_screened_plan_cache_keys_on_candidate_content() -> None:
+    from draftslice.cache.plan_cache import LRUPlanCache
+
+    cache = LRUPlanCache(max_bytes=1 << 20)
+    compiler = PlanCompiler(vocab_size=8, hidden_size=4, plan_cache=cache)
+    kwargs = dict(delta=0.05, calibration_id="cal-1")
+
+    first = compiler.compile_screened([state()], [TokenSet((1, 3))], **kwargs)
+    second = compiler.compile_screened([state()], [TokenSet((1, 3))], **kwargs)
+    assert cache.stats.hits == 1
+    assert cache.stats.misses == 1
+    assert first.nodes[0].plan == second.nodes[0].plan
+
+    # A different candidate set for the same state must not reuse the plan.
+    third = compiler.compile_screened([state()], [TokenSet((1, 5))], **kwargs)
+    assert cache.stats.hits == 1
+    assert cache.stats.misses == 2
+    assert third.nodes[0].plan.candidates.ids == (1, 5)
+
+    # A different delta is a different guarantee and must miss as well.
+    compiler.compile_screened([state()], [TokenSet((1, 3))], delta=0.1, calibration_id="cal-1")
+    assert cache.stats.hits == 1
+    assert cache.stats.misses == 3

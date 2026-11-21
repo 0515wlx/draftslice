@@ -15,6 +15,12 @@ from .bench.constraint import (
     write_constraint_result,
 )
 from .bench.e2e import E2EConfig, E2EError, run_matrix, run_method, write_e2e_result
+from .bench.factorial import (
+    BaselineRunnerError,
+    load_cases,
+    run_factorial,
+    write_factorial,
+)
 from .bench.gpu import ClockLockError, GpuClockController, GpuUnavailable
 from .bench.harness import HarnessError, evaluate, load_records, write_result
 from .bench.kernel import (
@@ -23,6 +29,13 @@ from .bench.kernel import (
     KernelBenchError,
     run_kernel_bench,
     write_kernel_result,
+)
+from .bench.release import (
+    ReleaseError,
+    ReleaseManifest,
+    build_release,
+    compare_manifests,
+    verify_manifest,
 )
 from .constraints.fixture import ConstraintFixtureError, fixture_from_dict, load_constraint_fixture
 from .plan.compiler import Budget, PlanBudgetError, PlanCompiler, PlanPolicy
@@ -215,6 +228,78 @@ def build_parser() -> argparse.ArgumentParser:
     e2e.add_argument("--warmup", type=int, default=1)
     e2e.add_argument("--repetitions", type=int, default=1)
     e2e.add_argument("--enforce-eager", action="store_true")
+
+    factorial = bench_sub.add_parser(
+        "factorial",
+        help="Run a screener x workload matrix over cached hidden states.",
+    )
+    factorial.add_argument("--input", required=True, help="Torch case file.")
+    factorial.add_argument(
+        "--artifact",
+        action="append",
+        default=[],
+        help="Screener artifact bundle directory (repeatable).",
+    )
+    factorial.add_argument(
+        "--include-full",
+        action="store_true",
+        help="Add the full-head reference screener.",
+    )
+    factorial.add_argument("--vocab-size", type=int, default=None)
+    factorial.add_argument("--out", required=True, help="Output result JSON.")
+    factorial.add_argument("--k", type=int, default=5)
+    factorial.add_argument("--dtype-bytes", type=int, default=2)
+    factorial.add_argument("--intersect-valid", action="store_true")
+
+    screen_cmd = sub.add_parser(
+        "screen",
+        help="Train screeners and build screener artifacts.",
+    )
+    screen_sub = screen_cmd.add_subparsers(dest="screen_command")
+
+    train_router = screen_sub.add_parser(
+        "train-router",
+        help="Train an MLP router from group marginals.",
+    )
+    train_router.add_argument("--input", required=True, help="Torch training file.")
+    train_router.add_argument("--out", required=True, help="Artifact bundle directory.")
+    train_router.add_argument("--top-c", type=int, required=True)
+    train_router.add_argument("--hidden-dim", type=int, default=None)
+    train_router.add_argument("--epochs", type=int, default=200)
+    train_router.add_argument("--learning-rate", type=float, default=1e-2)
+    train_router.add_argument("--batch-size", type=int, default=256)
+    train_router.add_argument("--validation-fraction", type=float, default=0.2)
+    train_router.add_argument("--weight-decay", type=float, default=0.0)
+    train_router.add_argument("--seed", type=int, default=0)
+    train_router.add_argument("--name", default="mlp_router")
+
+    report = bench_sub.add_parser(
+        "report",
+        help="Validate result files and render a release report.",
+    )
+    report.add_argument(
+        "--input", action="append", required=True, help="Result JSON (repeatable)."
+    )
+    report.add_argument("--out", required=True, help="Output Markdown path.")
+    report.add_argument("--name", required=True, help="Release name.")
+    report.add_argument(
+        "--metadata", default=None, help="Optional JSON object of release metadata."
+    )
+
+    validate = bench_sub.add_parser(
+        "validate",
+        help="Verify a release manifest and its result hashes.",
+    )
+    validate.add_argument("--manifest", required=True, help="release .manifest.json")
+    validate.add_argument("--no-hash", action="store_true", help="Skip file hashes.")
+
+    compare = bench_sub.add_parser(
+        "compare",
+        help="Render a B5 comparison between two release manifests.",
+    )
+    compare.add_argument("--base", required=True, help="Baseline manifest.")
+    compare.add_argument("--candidate", required=True, help="Candidate manifest.")
+    compare.add_argument("--out", required=True, help="Output Markdown path.")
 
     serve_cmd = sub.add_parser(
         "serve",
@@ -505,6 +590,187 @@ def _bench_e2e(args: argparse.Namespace) -> int:
     return 0
 
 
+def _bench_factorial(args: argparse.Namespace) -> int:
+    try:
+        cases = load_cases(args.input)
+        from .screen.artifacts import load_screener_bundle
+        from .screen.policies import FullPolicy
+
+        screeners = [load_screener_bundle(path)[0] for path in args.artifact]
+        if args.include_full:
+            vocab_size = args.vocab_size
+            if vocab_size is None:
+                max_token = max(
+                    [token for case in cases for row in case.truth for token in row]
+                    + [
+                        token
+                        for case in cases
+                        for row in (case.valid_sets or ())
+                        if row is not None
+                        for token in row
+                    ]
+                )
+                vocab_size = max_token + 1
+            screeners.append(FullPolicy(vocab_size=vocab_size))
+        if not screeners:
+            print("draftslice bench factorial: provide --artifact or --include-full.")
+            return 2
+        result = run_factorial(
+            screeners,
+            cases,
+            k=args.k,
+            intersect_valid=args.intersect_valid,
+            dtype_bytes=args.dtype_bytes,
+        )
+    except (BaselineRunnerError, FileNotFoundError, OSError, ValueError) as exc:
+        print(f"draftslice bench factorial: {exc}")
+        return 2
+    write_factorial(args.out, result)
+    print(f"wrote {args.out}")
+    for cell in result["cells"]:
+        print(
+            f"  {cell['screener']} / {cell['case']}: "
+            f"coverage={cell['coverage']:.4f} "
+            f"mean_candidates={cell['mean_candidates']:.1f}"
+        )
+    return 0
+
+
+def _screen_train_router(args: argparse.Namespace) -> int:
+    try:
+        import torch
+    except ImportError:
+        print("draftslice screen train-router: torch is required.")
+        return 2
+    try:
+        payload = torch.load(Path(args.input), map_location="cpu", weights_only=False)
+        if not isinstance(payload, dict):
+            raise ValueError("training file must contain an object")
+        hidden = payload["hidden"]
+        groups = tuple(tuple(int(token) for token in group) for group in payload["groups"])
+        if "group_mass" in payload:
+            group_mass = payload["group_mass"]
+        elif "tokens" in payload:
+            vocab_size = payload.get("vocab_size")
+            if vocab_size is None:
+                vocab_size = 1 + max(
+                    (int(token) for row in payload["tokens"] for token in row),
+                    default=0,
+                )
+            from .screen.router import group_mass_from_tokens
+
+            group_mass = group_mass_from_tokens(
+                payload["tokens"], groups, vocab_size=int(vocab_size)
+            )
+        else:
+            raise ValueError("training file needs 'group_mass' or 'tokens'")
+        from .screen.artifacts import build_screener_bundle
+        from .screen.router import train_router
+
+        policy, report = train_router(
+            hidden,
+            group_mass,
+            groups,
+            top_c=args.top_c,
+            hidden_dim=args.hidden_dim,
+            epochs=args.epochs,
+            learning_rate=args.learning_rate,
+            batch_size=args.batch_size,
+            validation_fraction=args.validation_fraction,
+            weight_decay=args.weight_decay,
+            seed=args.seed,
+            name=args.name,
+        )
+        vocab_size = payload.get("vocab_size")
+        if vocab_size is None:
+            vocab_size = 1 + max(
+                (token for group in groups for token in group), default=0
+            )
+        calibration = dict(payload.get("calibration") or {})
+        calibration.setdefault("calibration_id", f"router-{args.seed}")
+        calibration["training"] = report.to_dict()
+        bundle = build_screener_bundle(
+            policy,
+            vocab_size=int(vocab_size),
+            hidden_size=int(hidden.shape[1]),
+            calibration=calibration,
+        )
+        bundle.write(args.out)
+    except KeyError as exc:
+        print(f"draftslice screen train-router: missing key {exc}")
+        return 2
+    except (OSError, ValueError, RuntimeError) as exc:
+        print(f"draftslice screen train-router: {exc}")
+        return 2
+
+    report_path = Path(args.out) / "training_report.json"
+    report_path.write_text(
+        json.dumps(
+            {"screener": policy.name, "vocab_size": int(vocab_size), **report.to_dict()},
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    print(
+        f"wrote {args.out} (loss {report.initial_loss:.4f} -> "
+        f"{report.final_loss:.4f}, val={report.validation_loss})"
+    )
+    return 0
+
+
+def _bench_report(args: argparse.Namespace) -> int:
+    try:
+        metadata = {} if args.metadata is None else json.loads(args.metadata)
+        if not isinstance(metadata, dict):
+            raise ValueError("--metadata must be a JSON object")
+        manifest, report = build_release(
+            args.name,
+            args.input,
+            out=args.out,
+            metadata=metadata,
+        )
+    except (ReleaseError, json.JSONDecodeError, OSError, ValueError) as exc:
+        print(f"draftslice bench report: {exc}")
+        return 2
+    print(
+        f"wrote {args.out} and {Path(args.out).with_suffix('.manifest.json')} "
+        f"({len(manifest.files)} files, commit={manifest.git_commit or 'unknown'})"
+    )
+    if report.count("\n## "):
+        print(f"  sections: {report.count(chr(10) + '## ')}")
+    return 0
+
+
+def _bench_validate(args: argparse.Namespace) -> int:
+    try:
+        manifest = ReleaseManifest.load(args.manifest)
+        problems = verify_manifest(manifest, check_hashes=not args.no_hash)
+    except (ReleaseError, json.JSONDecodeError, OSError) as exc:
+        print(f"draftslice bench validate: {exc}")
+        return 2
+    if problems:
+        for problem in problems:
+            print(f"  {problem}")
+        return 2
+    print(f"ok: {len(manifest.files)} files verified for {manifest.name}")
+    return 0
+
+
+def _bench_compare(args: argparse.Namespace) -> int:
+    try:
+        base = ReleaseManifest.load(args.base)
+        candidate = ReleaseManifest.load(args.candidate)
+        report = compare_manifests(base, candidate)
+    except (ReleaseError, json.JSONDecodeError, OSError) as exc:
+        print(f"draftslice bench compare: {exc}")
+        return 2
+    Path(args.out).write_text(report, encoding="utf-8")
+    print(f"wrote {args.out}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -524,10 +790,23 @@ def main(argv: list[str] | None = None) -> int:
             return _bench_constraint(args)
         if args.bench_command == "e2e":
             return _bench_e2e(args)
+        if args.bench_command == "factorial":
+            return _bench_factorial(args)
+        if args.bench_command == "report":
+            return _bench_report(args)
+        if args.bench_command == "validate":
+            return _bench_validate(args)
+        if args.bench_command == "compare":
+            return _bench_compare(args)
         if args.config:
             print("draftslice bench: config-driven runners land in M2; no run started.")
             return 2
         print("draftslice bench: provide a subcommand (for example 'accuracy').")
+        return 2
+    if args.command == "screen":
+        if args.screen_command == "train-router":
+            return _screen_train_router(args)
+        print("draftslice screen: provide a subcommand (for example 'train-router').")
         return 2
     if args.command == "serve":
         print("draftslice serve: the engine adapters land in M4; no server started.")

@@ -43,7 +43,23 @@ Completed:
   The vLLM adapter can opt into the same constrained intersection
   (`DRAFTSLICE_VLLM_SCREENER`) on top of its worker-side grammar shadow, with
   per-call candidate/drop counters and a full-head fallback on screener errors
-  or empty intersections.
+  or empty intersections. Screener artifacts (`screener/1` bundles) and
+  `DRAFTSLICE_VLLM_SCREENER_ARTIFACT` load the trained policy without changing
+  the candidate algorithm; `DRAFTSLICE_VLLM_SCREENER_UNIVERSE=vocab` enables the
+  free-form mode while still intersecting whenever a grammar state exists.
+- Screened-plan cache keys include the candidate token tuple, delta, universe,
+  calibration id, budget, and layout, so the same grammar state with a different
+  hidden state cannot reuse a stale candidate plan.
+- M5 training/evaluation: `screen.router` trains an MLP router from group
+  marginals, `screen.artifacts` serializes full/static/group/router/low-rank
+  screeners into verified bundles, and `bench.factorial` runs a screener x
+  workload matrix with coverage and candidate-cost cells.
+- M6 release tooling: `bench.release` writes hashed release manifests and
+  Markdown reports for every implemented result schema, verifies hashes, and
+  compares releases for B5 regressions. The SGLang adapter boundary is
+  implemented and tested as a pure candidate transform; runtime registration is
+  gated on a complete SGLang install (the reference environment lacks
+  `sgl_kernel`).
 - xgrammar adapter for JSON Schema and regex sessions, including B3 trajectory
   recording.
 - B4 vLLM end-to-end runner (`draftslice bench e2e`) and a first
@@ -55,12 +71,11 @@ Still open (details in §18):
 
 - stable cross-request xgrammar state hashing and a full grammar replay corpus;
 - optimized TP sharding and quantized LM-head paths (safe fallbacks exist);
-- wiring `screen.registry` sources into the vLLM adapter (the constrained
-  intersection is implemented; free-form calibrated modes and artifact loading
-  are not);
-- the DFlash per-block adapter and the SGLang draft-path hook;
-- calibrated end-to-end runs on the full dataset mix;
-- the release benchmark with one-command reproduction.
+- the DFlash per-block adapter (block-position grammar state is not available);
+- calibrated end-to-end runs on the full dataset mix and a multi-seed release
+  run on the reference hardware;
+- SGLang runtime validation (the boundary is implemented, but the reference
+  SGLang install is missing `sgl_kernel`).
 
 
 ## 1. What we are building
@@ -992,9 +1007,11 @@ DoD:
 - Full B1 accuracy matrix.
 
 Implemented so far: deterministic partition builder, split-conformal
-calibration, content-hashed artifact bundles, `compile_calibrated`, and the
-acceptance model. Router training, a screener registry, and the calibrated
-end-to-end modes remain.
+calibration, content-hashed artifact bundles, `compile_calibrated`, the
+acceptance model, the screener registry, the group-marginal router trainer,
+screener artifacts, screened-plan cache keys, the factorial evaluator, and the
+constrained/free-form vLLM screener hook. Published multi-seed B1 numbers and
+calibrated end-to-end tables remain release work.
 
 DoD:
 
@@ -1009,11 +1026,22 @@ DoD:
 - B1–B4 release run, multi-seed, report generator.
 - CI/nightly/release gates.
 
+Implemented so far: the SGLang candidate transform and guarded boundary, the
+factorial B1 matrix, hashed release manifests and Markdown reports for every
+result schema, B5 manifest comparison, and nightly/release workflows that run
+the offline pipeline. The SGLang engine hook is not validated because the
+reference install lacks `sgl_kernel`; multi-seed B1–B4 results are operator data,
+not repository content.
+
 DoD:
 
-- One command reproduces each published table and figure.
-- Every result has a manifest, dataset hash, and code commit.
-- Negative results and failed configurations are reported.
+- One command reproduces each published table and figure. **`draftslice bench
+  report` renders all implemented schemas; the published run inputs remain
+  external.**
+- Every result has a manifest, dataset hash, and code commit. **Hashes and the
+  commit are recorded; dataset hashes are supplied in result metadata.**
+- Negative results and failed configurations are reported. **Warnings and
+  missing result kinds are rendered and flagged by `bench compare`.**
 
 ## 14. Risks and open questions
 
@@ -1178,6 +1206,12 @@ Environment controls:
   intersected with the exact grammar set. Empty/unset means off.
 - `DRAFTSLICE_VLLM_SCREENER_ARGS` is a JSON object passed to the screener
   factory (for example `'{"rows": [1, 2, 3]}'` for `static`).
+- `DRAFTSLICE_VLLM_SCREENER_ARTIFACT` loads a verified `screener/1` bundle
+  instead of constructing the policy from JSON; the bundle's calibration id and
+  delta are reported in the stats.
+- `DRAFTSLICE_VLLM_SCREENER_UNIVERSE` is `valid` (default) or `vocab`. `vocab`
+  uses candidates directly on free-form rows and still intersects every row
+  that has a grammar state.
 - `DRAFTSLICE_VLLM_CUDA_GRAPH=1` enables the kernel-level graph replay cache. It
   is opt-in because capture must not run inside the engine's own graph capture;
   capture failure falls back to eager.
@@ -1311,13 +1345,14 @@ an engine adapter.
 
 The partition builder, split-conformal calibrator, artifact bundle,
 `compile_calibrated`, the `screen.registry` (full/static/low-rank/group/router/
-CFHead/FlashHead/VocabTrim), and `compile_screened` / `compile_step(screener=...)`
-are implemented. The vLLM adapter now has an opt-in constrained screener hook
-(`DRAFTSLICE_VLLM_SCREENER` + JSON args) that computes `A ∩ V` per row and falls
-back to the full head on errors or empty intersections. The remaining work is
-router training on group marginals, candidate-set cache wiring for screened
-plans, artifact loading for the vLLM hook, and the `constrained_calibrated` /
-`freeform_calibrated` end-to-end modes.
+CFHead/FlashHead/VocabTrim), `compile_screened` / `compile_step(screener=...)`,
+the router trainer, screener artifact bundles, the screened-plan cache, and the
+factorial evaluator are implemented. The vLLM adapter has an opt-in constrained
+screener hook (`DRAFTSLICE_VLLM_SCREENER` / `_ARTIFACT`) and a free-form
+`universe=vocab` mode that still intersects rows with a grammar state. The
+remaining work is a full multi-seed B1 matrix on the prescribed dataset mix and
+published calibrated end-to-end numbers; the code paths exist but the public
+repository does not ship datasets or result files.
 
 ### 18.4 vLLM hardening
 
@@ -1326,8 +1361,9 @@ plans, artifact loading for the vLLM hook, and the `constrained_calibrated` /
 - Support quantized LM heads through the quant method, not raw weights.
 - Validate grammar-state timing against real structured traces.
 - Wire `screen.registry` sources (static/low-rank/group/router) into the
-  draft-logits hook; the constrained `A ∩ V` hook is implemented, but artifact
-  loading/calibration identity and free-form mode are not.
+  draft-logits hook; the constrained and free-form screener paths are
+  implemented, and the remaining gap is TP/quantized draft heads and per-request
+  calibration artifacts.
 - CUDA graph buckets for dynamic candidate sizes. The kernel-level
   `CudaGraphCache` exists; the adapter must still keep a stable hidden workspace
   and row buffer.
@@ -1368,10 +1404,17 @@ benchmark compares built-in `dflash` at block sizes 8 and 16 against
 
 ### 18.6 SGLang
 
-- Mirror the vLLM adapter at SGLang's draft-path hook.
-- Reuse the same plan/compiler/executor contracts; only the grammar-state and
-  batching adapters should differ.
-- Add DFlash to the SGLang adapter using the same block-position plan contract.
+- The candidate transform (`integrations/sglang.screen_logits`) and environment
+  boundary are implemented and unit-tested. `register()` refuses to claim an
+  engine hook when SGLang's speculative worker cannot be imported.
+- Runtime status: the reference environment has SGLang 0.5.2 but lacks
+  `sgl_kernel`, so the EAGLE worker hook has not been validated end to end.
+- The host hook wraps the draft head (or masks captured logits) with
+  `screen_logits`, and falls back to the full head when per-request grammar
+  state is absent. Reuse the plan/compiler/executor contracts; only the
+  grammar-state and batching adapters should differ.
+- Add DFlash to the SGLang adapter using the same block-position plan contract
+  after the vLLM DFlash per-position state exists.
 
 ### 18.7 Release benchmark
 
@@ -1380,8 +1423,11 @@ benchmark compares built-in `dflash` at block sizes 8 and 16 against
 - B3 real grammar-state replay (the runner and xgrammar adapter exist).
 - B4 end-to-end matrix with validity, tau, throughput, and quality (the runner
   exists; the first sweep is `mtp` vs `draftslice_mtp`).
-- One-command reproduction and negative results.
-- Full calibrated end-to-end runs once the router/screener is trained.
+- `draftslice bench report` builds a hashed manifest and Markdown report from
+  any mix of B1-B4 results; `bench validate` and `bench compare` implement the
+  B5 gate. Nightly/release workflows run the offline pipeline on synthetic data.
+- Remaining: publish multi-seed results for the prescribed dataset mix and the
+  reference GPU; the repository intentionally ships no datasets or result files.
 
 ### 18.8 Kernel work remaining
 

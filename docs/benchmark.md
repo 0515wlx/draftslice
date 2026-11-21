@@ -610,6 +610,21 @@ draftslice compile --schema tests/fixtures/token_set.json --out plan.json
 # Implemented: B1 over cached candidate records
 draftslice bench accuracy --input records.jsonl --out result.json --k 5
 
+# Implemented: screener x workload matrix over cached hidden states
+draftslice bench factorial --input cases.pt --artifact artifacts/router \
+  --out result.json --k 5
+
+# Implemented: train a router artifact from group marginals
+draftslice screen train-router --input train.pt --out artifacts/router \
+  --top-c 16
+
+# Implemented: release manifest, report, validation, and B5 comparison
+draftslice bench report --name release-2026-11 --out runs/release/report.md \
+  --input result.json
+draftslice bench validate --manifest runs/release/report.manifest.json
+draftslice bench compare --base runs/base/report.manifest.json \
+  --candidate runs/release/report.manifest.json --out runs/release/compare.md
+
 # Planned: config-driven tiers
 draftslice bench conformance --config benchmarks/configs/b0.toml
 draftslice bench accuracy  --config benchmarks/configs/b1_a100.toml

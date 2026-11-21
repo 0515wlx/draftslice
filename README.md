@@ -23,12 +23,17 @@ registry and screened plan compilation (strict, constrained-calibrated, and
 free-form calibrated), fixed-clock Torch/Triton kernels with shape dispatch,
 CUDA-graph replay and opt-in autotuning, an xgrammar constraint adapter with B3
 replay, a vLLM plugin with a strict constrained draft path, a per-position
-grammar shadow, and an opt-in constrained screener hook, a B4 end-to-end runner,
-and a fair offline baseline suite
-including CFHead/FlashHead/VocabTrim-style reference policies. The public DFlash draft
+grammar shadow, and an opt-in constrained/free-form screener hook, a B4
+end-to-end runner, and a fair offline baseline suite
+including CFHead/FlashHead/VocabTrim-style reference policies. M5 tooling now
+includes group-marginal router training, verified screener artifacts, a
+factorial evaluator, and screened-plan cache keys; M6
+includes hashed release manifests, Markdown reports, B5 comparison, and an
+SGLang boundary (engine validation is blocked by a missing `sgl_kernel` in the
+reference install). The public DFlash draft
 `z-lab/Qwen3.5-4B-DFlash` is verified with vLLM's built-in `dflash` path;
 DraftSlice's DFlash adapter is future work. The calibrated screener training,
-SGLang adapter, and full release benchmark are still in progress. Research code,
+full release benchmark, and SGLang engine hook are still in progress. Research code,
 experimental data, and benchmark results are intentionally not part of this
 repository.
 
@@ -156,10 +161,13 @@ block-position slicing is not enabled. See
 - **M4** vLLM integration: plugin and strict draft-step-0 path (done); TP/quantized
   hardening and end-to-end structured workloads next
 - **M5** fair baseline suite (implemented, including CFHead/FlashHead reference
-  policies), artifact/partition/conformal core, calibrated plan compilation, and
-  the acceptance model (implemented); router training and calibrated end-to-end
-  runs next
-- **M6** DFlash adapter, SGLang integration, and release benchmark
+  policies), artifact/partition/conformal core, calibrated plan compilation,
+  the acceptance model, router training, screener artifacts, and the factorial
+  matrix (implemented); published multi-seed calibrated runs next
+- **M6** SGLang boundary (implemented; engine validation blocked), DFlash
+  per-block adapter (blocked on per-position grammar state), release manifests,
+  reports, B5 comparison, and CI gates (implemented); multi-seed release run
+  next
 
 Each milestone has a definition of done in
 [docs/architecture.md](docs/architecture.md); the benchmark gates are in

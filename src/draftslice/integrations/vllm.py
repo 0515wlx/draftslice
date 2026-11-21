@@ -20,7 +20,7 @@ import json
 import os
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import numpy as np
@@ -59,10 +59,14 @@ class DraftSliceVllmStats:
     propose_shadow_calls: int = 0
     graph_replay_calls: int = 0
     screener_name: str | None = None
+    screener_universe: str | None = None
+    screener_calibration_id: str | None = None
+    screener_delta: float | None = None
     screener_calls: int = 0
     screener_rows: int = 0
     screener_dropped: int = 0
     screener_empty_rows: int = 0
+    screener_freeform_rows: int = 0
     screener_errors: int = 0
     mask_stride: int = 0
     last_error: str | None = None
@@ -100,10 +104,14 @@ class DraftSliceVllmStats:
             "propose_shadow_calls": self.propose_shadow_calls,
             "graph_replay_calls": self.graph_replay_calls,
             "screener_name": self.screener_name,
+            "screener_universe": self.screener_universe,
+            "screener_calibration_id": self.screener_calibration_id,
+            "screener_delta": self.screener_delta,
             "screener_calls": self.screener_calls,
             "screener_rows": self.screener_rows,
             "screener_dropped": self.screener_dropped,
             "screener_empty_rows": self.screener_empty_rows,
+            "screener_freeform_rows": self.screener_freeform_rows,
             "screener_errors": self.screener_errors,
             "mask_stride": self.mask_stride,
             "last_error": self.last_error,
@@ -172,6 +180,10 @@ class ScreenerConfig:
 
     name: str
     args: dict[str, Any] = field(default_factory=dict)
+    artifact: str | None = None
+    universe: str = "valid"
+    calibration_id: str | None = None
+    delta: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,6 +194,7 @@ class ScreenedValidSets:
     rows: int
     dropped: int
     empty_rows: int
+    freeform_rows: int = 0
 
 
 def _screener_config() -> ScreenerConfig | None:
@@ -193,8 +206,14 @@ def _screener_config() -> ScreenerConfig | None:
     """
 
     raw_name = os.environ.get("DRAFTSLICE_VLLM_SCREENER", "").strip()
-    if raw_name.lower() in _SCREENER_OFF:
+    artifact = os.environ.get("DRAFTSLICE_VLLM_SCREENER_ARTIFACT", "").strip() or None
+    if raw_name.lower() in _SCREENER_OFF and artifact is None:
         return None
+    universe = os.environ.get("DRAFTSLICE_VLLM_SCREENER_UNIVERSE", "valid").strip().lower()
+    if universe not in ("valid", "vocab"):
+        raise VllmIntegrationError(
+            "DRAFTSLICE_VLLM_SCREENER_UNIVERSE must be 'valid' or 'vocab'"
+        )
     raw_args = os.environ.get("DRAFTSLICE_VLLM_SCREENER_ARGS", "").strip()
     args: dict[str, Any] = {}
     if raw_args:
@@ -209,20 +228,31 @@ def _screener_config() -> ScreenerConfig | None:
                 "DRAFTSLICE_VLLM_SCREENER_ARGS must be a JSON object"
             )
         args = parsed
-    return ScreenerConfig(name=raw_name, args=args)
+    return ScreenerConfig(
+        name="" if artifact is not None and raw_name.lower() in _SCREENER_OFF else raw_name,
+        args=args,
+        artifact=artifact,
+        universe=universe,
+    )
 
 
 def _screen_valid_sets(
     valid_sets: list[TokenSet | None],
     candidates: list[TokenSet],
+    *,
+    universe: str = "valid",
 ) -> ScreenedValidSets:
     """Apply ``A := A ∩ V`` row by row.
 
-    Rows without an exact valid set (``None``) stay on the full-head fallback,
-    because there is no universe to intersect with. An empty intersection also
-    falls back to the full head instead of silently dropping every candidate.
+    With ``universe="valid"`` rows without an exact valid set (``None``) stay on
+    the full-head fallback. With ``universe="vocab"`` those rows use ``A``
+    directly (free-form), while rows that do have a grammar state still
+    intersect with it so the adapter never proposes a grammar-invalid draft.
+    An empty intersection always falls back to the full head.
     """
 
+    if universe not in ("valid", "vocab"):
+        raise VllmIntegrationError("universe must be 'valid' or 'vocab'")
     if len(candidates) != len(valid_sets):
         raise VllmIntegrationError(
             f"screener returned {len(candidates)} rows for {len(valid_sets)} states"
@@ -231,12 +261,17 @@ def _screen_valid_sets(
     rows = 0
     dropped = 0
     empty_rows = 0
+    freeform_rows = 0
     for valid, candidate in zip(valid_sets, candidates, strict=True):
-        if valid is None:
-            screened.append(None)
-            continue
         if not isinstance(candidate, TokenSet):
             raise VllmIntegrationError("screener must return TokenSet rows")
+        if valid is None:
+            if universe == "vocab" and not candidate.is_empty:
+                screened.append(candidate)
+                freeform_rows += 1
+            else:
+                screened.append(None)
+            continue
         selected = candidate.intersection(valid)
         rows += 1
         dropped += len(valid) - len(selected)
@@ -250,6 +285,7 @@ def _screen_valid_sets(
         rows=rows,
         dropped=dropped,
         empty_rows=empty_rows,
+        freeform_rows=freeform_rows,
     )
 
 
@@ -610,7 +646,7 @@ class DraftSliceSpeculatorMixin:
         ]
 
     def _ensure_screener(self) -> None:
-        """Build the configured registry screener once per speculator."""
+        """Build the configured registry screener or load its artifact once."""
 
         if self._draftslice_screener_ready:
             return
@@ -623,12 +659,24 @@ class DraftSliceSpeculatorMixin:
         if config is None:
             return
         try:
-            from ..screen import get_screener
+            if config.artifact:
+                from ..screen import load_screener_bundle
 
-            screener = get_screener(config.name, **config.args)
+                screener, bundle = load_screener_bundle(config.artifact)
+                calibration = bundle.manifest.calibration or {}
+                config = replace(
+                    config,
+                    name=screener.name,
+                    calibration_id=calibration.get("calibration_id"),
+                    delta=calibration.get("delta"),
+                )
+            else:
+                from ..screen import get_screener
+
+                screener = get_screener(config.name, **config.args)
         except Exception as exc:
             self._draftslice_stats.record_error(
-                f"screener init {config.name!r}: {exc}"
+                f"screener init {config.artifact or config.name!r}: {exc}"
             )
             return
         self._draftslice_screener = screener
@@ -637,11 +685,22 @@ class DraftSliceSpeculatorMixin:
             import sys
 
             print(
-                f"[draftslice] screener={config.name!r} args={config.args} "
-                "(constrained: A := A ∩ V)",
+                f"[draftslice] screener={config.name!r} "
+                f"artifact={config.artifact!r} universe={config.universe!r} "
+                f"calibration={config.calibration_id!r}",
                 file=sys.stderr,
                 flush=True,
             )
+
+    @staticmethod
+    def _move_screener(screener: Any, device: Any) -> Any:
+        updates: dict[str, Any] = {}
+        for name in ("centroids", "w1", "w2", "vr", "a", "group_mass"):
+            value = getattr(screener, name, None)
+            if value is not None and hasattr(value, "to"):
+                if getattr(value, "device", None) != device:
+                    updates[name] = value.to(device)
+        return replace(screener, **updates) if updates else screener
 
     def _apply_screener(
         self,
@@ -661,10 +720,19 @@ class DraftSliceSpeculatorMixin:
         if screener is None or config is None:
             return valid_sets
         self._draftslice_stats.screener_name = config.name
+        self._draftslice_stats.screener_universe = config.universe
+        self._draftslice_stats.screener_calibration_id = config.calibration_id
+        self._draftslice_stats.screener_delta = config.delta
+        device = getattr(hidden_states, "device", None)
+        if device is not None:
+            screener = self._move_screener(screener, device)
+            self._draftslice_screener = screener
         t0 = time.perf_counter()
         try:
             candidates = screener.candidates(hidden_states)
-            result = _screen_valid_sets(valid_sets, candidates)
+            result = _screen_valid_sets(
+                valid_sets, candidates, universe=config.universe
+            )
         except Exception as exc:
             self._draftslice_stats.screener_errors += 1
             self._draftslice_stats.record_error(f"screener {config.name!r}: {exc}")
@@ -674,6 +742,7 @@ class DraftSliceSpeculatorMixin:
         self._draftslice_stats.screener_rows += result.rows
         self._draftslice_stats.screener_dropped += result.dropped
         self._draftslice_stats.screener_empty_rows += result.empty_rows
+        self._draftslice_stats.screener_freeform_rows += result.freeform_rows
         return result.sets
 
     def _lm_head_weight(self) -> Any | None:
@@ -730,27 +799,52 @@ class DraftSliceSpeculatorMixin:
             self._draftslice_stats.nonzero_step_calls += 1
             self._draftslice_stats.record(sliced=False)
             return base_compute(hidden_states, spec_step_idx)
-        if (
-            self._draftslice_snapshot is None
-            and self._draftslice_shadow is None
-        ) or (
-            self._draftslice_idx_mapping is None
-            and self._draftslice_idx_mapping_np is None
-        ):
-            self._draftslice_stats.no_snapshot_calls += 1
-            self._draftslice_stats.record(sliced=False)
-            return base_compute(hidden_states, spec_step_idx)
 
-        valid_sets = self._valid_sets_for_rows(hidden_states)
-        if valid_sets is None or not any(token_set is not None for token_set in valid_sets):
-            self._draftslice_stats.no_valid_sets_calls += 1
-            self._draftslice_stats.record(sliced=False)
-            return base_compute(hidden_states, spec_step_idx)
-
-        valid_sets = self._apply_screener(hidden_states, valid_sets)
-        if not any(token_set is not None for token_set in valid_sets):
-            self._draftslice_stats.record(sliced=False)
-            return base_compute(hidden_states, spec_step_idx)
+        self._ensure_screener()
+        screener_config = self._draftslice_screener_config
+        screener_active = (
+            self._draftslice_screener is not None and screener_config is not None
+        )
+        no_state = (
+            (self._draftslice_snapshot is None and self._draftslice_shadow is None)
+            or (
+                self._draftslice_idx_mapping is None
+                and self._draftslice_idx_mapping_np is None
+            )
+        )
+        if not screener_active:
+            if no_state:
+                self._draftslice_stats.no_snapshot_calls += 1
+                self._draftslice_stats.record(sliced=False)
+                return base_compute(hidden_states, spec_step_idx)
+            valid_sets = self._valid_sets_for_rows(hidden_states)
+            if valid_sets is None or not any(
+                token_set is not None for token_set in valid_sets
+            ):
+                self._draftslice_stats.no_valid_sets_calls += 1
+                self._draftslice_stats.record(sliced=False)
+                return base_compute(hidden_states, spec_step_idx)
+        else:
+            if screener_config.universe == "valid":
+                if no_state:
+                    self._draftslice_stats.no_snapshot_calls += 1
+                    self._draftslice_stats.record(sliced=False)
+                    return base_compute(hidden_states, spec_step_idx)
+                valid_sets = self._valid_sets_for_rows(hidden_states)
+                if valid_sets is None or not any(
+                    token_set is not None for token_set in valid_sets
+                ):
+                    self._draftslice_stats.no_valid_sets_calls += 1
+                    self._draftslice_stats.record(sliced=False)
+                    return base_compute(hidden_states, spec_step_idx)
+            else:
+                valid_sets = self._valid_sets_for_rows(hidden_states)
+                if valid_sets is None:
+                    valid_sets = [None] * int(hidden_states.shape[0])
+            valid_sets = self._apply_screener(hidden_states, valid_sets)
+            if not any(token_set is not None for token_set in valid_sets):
+                self._draftslice_stats.record(sliced=False)
+                return base_compute(hidden_states, spec_step_idx)
 
         weight = self._lm_head_weight()
         if weight is None:

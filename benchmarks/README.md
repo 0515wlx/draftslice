@@ -25,11 +25,43 @@ Local model roots are supplied through an operator environment variable such as
 
 ## Status
 
-The current harness covers the conformance tests, the B1 metric definitions, an
+The harness covers the conformance tests, the B1 metric definitions, an
 offline B1 accuracy runner over cached candidate records, the B2 kernel runner,
-and the fair candidate-policy baseline matrix (including CFHead/FlashHead-style
-reference policies). The dataset adapter, B3 constraint replay, and B4 engine
-runners land in later milestones.
+the fair candidate-policy baseline matrix (including CFHead/FlashHead-style
+reference policies), the B3 constraint replay, the B4 vLLM runner, the
+screener factorial matrix, and release manifests/reports. The dataset adapters
+and published multi-seed runs remain operator work.
+
+## Release pipeline
+
+A release is a set of result JSON files (any mix of `bench/1`,
+`baseline_matrix/1`, `factorial/1`, `constraint_bench/1`, `kernel_bench/1`, and
+`e2e/1`) plus a manifest:
+
+```bash
+# 1. Produce results, one process per method where needed.
+draftslice bench kernel --gpu 0 --out results/kernel.json
+draftslice bench factorial --input cases.pt --artifact artifacts/router \
+  --out results/factorial.json
+draftslice bench e2e --model "$DRAFTSLICE_MODEL_ROOT/Qwen3.5-4B" \
+  --method mtp --out results/e2e_mtp.json
+draftslice bench e2e --model "$DRAFTSLICE_MODEL_ROOT/Qwen3.5-4B" \
+  --method draftslice_mtp --out results/e2e_draftslice_mtp.json
+
+# 2. Render a hashed report (writes report.md and report.manifest.json).
+draftslice bench report --name release-2026-11 --out runs/release/report.md \
+  --input results/kernel.json --input results/factorial.json \
+  --input results/e2e_mtp.json --input results/e2e_draftslice_mtp.json
+
+# 3. Verify and compare against a previous release.
+draftslice bench validate --manifest runs/release/report.manifest.json
+draftslice bench compare --base runs/base/report.manifest.json \
+  --candidate runs/release/report.manifest.json --out runs/release/compare.md
+```
+
+The nightly and release workflows run the engine-free version of this pipeline
+(`benchmarks/smoke_pipeline.py`) so manifest/report regressions fail CI before a
+GPU run starts.
 
 ## Fixed-frequency performance runs
 

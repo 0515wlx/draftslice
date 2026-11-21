@@ -387,6 +387,21 @@ class PlanCompiler:
             else:
                 selected = candidate
                 valid_universe = None
+            cache_key = self._screened_cache_key(
+                current.state_id,
+                selected,
+                universe=universe,
+                delta=delta,
+                budget=budget,
+                policy=policy,
+                source=source,
+                calibration_id=calibration_id,
+            )
+            if cache_key is not None:
+                cached = self.plan_cache.get(cache_key)
+                if cached is not None:
+                    nodes.append(NodePlan(node_id=index, plan=cached))
+                    continue
             if selected.is_empty:
                 if not budget.allow_full_fallback:
                     raise PlanBudgetError("screened candidate set is empty")
@@ -402,8 +417,52 @@ class PlanCompiler:
                     source=source,
                     calibration_id=calibration_id,
                 )
+            if cache_key is not None:
+                self.plan_cache.put_keyed(cache_key, plan)
             nodes.append(NodePlan(node_id=index, plan=plan))
         return self._step_from_nodes(nodes)
+
+    def _screened_cache_key(
+        self,
+        state_id: int | None,
+        candidates: TokenSet,
+        *,
+        universe: Universe,
+        delta: float,
+        budget: Budget,
+        policy: PlanPolicy,
+        source: str,
+        calibration_id: str | None,
+    ) -> tuple[Any, ...] | None:
+        """Key screened plans by state, candidate content, and guarantee.
+
+        Unlike a strict plan, a screened plan cannot be keyed by the grammar
+        state alone: the same state can receive different hidden states and
+        therefore different candidate sets. The token tuple is part of the key,
+        so a cached plan is only reused for the exact same ``A``.
+        """
+
+        if self.plan_cache is None or state_id is None:
+            return None
+        return (
+            "screened",
+            state_id,
+            candidates.ids,
+            universe,
+            delta,
+            calibration_id,
+            source,
+            budget.max_candidates,
+            budget.max_bytes,
+            budget.deadline_ms,
+            budget.allow_full_fallback,
+            policy.mode,
+            policy.layout,
+            policy.prefer_kernel,
+            self.vocab_size,
+            self.hidden_size,
+            self.dtype_bytes,
+        )
 
     def _step_from_nodes(self, nodes: Sequence[NodePlan]) -> StepPlan:
         nodes = tuple(nodes)
