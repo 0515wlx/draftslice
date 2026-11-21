@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Add an opt-in vLLM screener hook. `DRAFTSLICE_VLLM_SCREENER` names a
+  `screen.registry` source and `DRAFTSLICE_VLLM_SCREENER_ARGS` supplies its JSON
+  kwargs; the adapter intersects candidates with the exact worker-side grammar
+  set (`A := A ∩ V`) before building sliced draft logits. Screener failures and
+  empty intersections fall back to the full head, and
+  `screener_calls/rows/dropped/empty_rows/errors` are exposed through
+  `draftslice_stats()`. This is constrained-calibrated semantics: only candidate
+  selection is approximate, and the target verifier remains exact.
 - Add a unified candidate-source layer. `screen.registry` exposes full, static/
   VocabTrim, SVD/trained low-rank, group/cluster, MLP router, and oracle
   screeners (CFHead/FlashHead/VocabTrim are lazy reference sources), and

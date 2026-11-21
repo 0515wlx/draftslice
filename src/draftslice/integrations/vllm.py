@@ -5,6 +5,8 @@ This is a strict-mode first integration:
 - a custom vLLM speculator wraps the built-in MTP or EAGLE-3 speculator;
 - the structured-output bitmask is captured from the worker;
 - draft step 0 slices the draft LM head to the grammar-valid rows;
+- an opt-in registry screener can further narrow those rows with constrained
+  ``A := A ∩ V`` semantics (the target verifier still enforces the grammar);
 - later draft steps, TP > 1, quantized heads, and unsupported dtypes fall back
   to the full draft head.
 
@@ -14,6 +16,7 @@ It deliberately does not import vLLM from the core package.
 
 from __future__ import annotations
 
+import json
 import os
 import threading
 import time
@@ -22,6 +25,7 @@ from typing import Any
 
 import numpy as np
 
+from ..plan.types import TokenSet
 from .vllm_grammar import (
     GrammarSnapshot,
     current_grammar_snapshot,
@@ -31,7 +35,7 @@ from .vllm_logits import build_draft_logits
 
 _REGISTERED = False
 _SHADOW_PATCHED = False
-_TIMING = {"observe": 0.0, "valid": 0.0, "build": 0.0, "calls": 0}
+_TIMING = {"observe": 0.0, "valid": 0.0, "build": 0.0, "screen": 0.0, "calls": 0}
 _LOCK = threading.Lock()
 
 
@@ -54,6 +58,12 @@ class DraftSliceVllmStats:
     propose_calls: int = 0
     propose_shadow_calls: int = 0
     graph_replay_calls: int = 0
+    screener_name: str | None = None
+    screener_calls: int = 0
+    screener_rows: int = 0
+    screener_dropped: int = 0
+    screener_empty_rows: int = 0
+    screener_errors: int = 0
     mask_stride: int = 0
     last_error: str | None = None
     errors: list[str] = field(default_factory=list)
@@ -89,6 +99,12 @@ class DraftSliceVllmStats:
             "propose_calls": self.propose_calls,
             "propose_shadow_calls": self.propose_shadow_calls,
             "graph_replay_calls": self.graph_replay_calls,
+            "screener_name": self.screener_name,
+            "screener_calls": self.screener_calls,
+            "screener_rows": self.screener_rows,
+            "screener_dropped": self.screener_dropped,
+            "screener_empty_rows": self.screener_empty_rows,
+            "screener_errors": self.screener_errors,
             "mask_stride": self.mask_stride,
             "last_error": self.last_error,
             "errors": list(self.errors),
@@ -147,6 +163,97 @@ def _max_slice_rows(vocab_size: int) -> int:
     return max(1, min(vocab_size, value))
 
 
+_SCREENER_OFF = {"", "0", "false", "off", "none"}
+
+
+@dataclass(frozen=True, slots=True)
+class ScreenerConfig:
+    """Opt-in configuration for a registry candidate source."""
+
+    name: str
+    args: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class ScreenedValidSets:
+    """Result of intersecting screened candidates with exact valid sets."""
+
+    sets: list[TokenSet | None]
+    rows: int
+    dropped: int
+    empty_rows: int
+
+
+def _screener_config() -> ScreenerConfig | None:
+    """Read the screener name and JSON kwargs from the environment.
+
+    Screening is opt-in because it drops grammar-valid tokens from the draft
+    head. The target verifier still enforces the grammar exactly, but the draft
+    distribution is approximate, so the default remains the full/exact path.
+    """
+
+    raw_name = os.environ.get("DRAFTSLICE_VLLM_SCREENER", "").strip()
+    if raw_name.lower() in _SCREENER_OFF:
+        return None
+    raw_args = os.environ.get("DRAFTSLICE_VLLM_SCREENER_ARGS", "").strip()
+    args: dict[str, Any] = {}
+    if raw_args:
+        try:
+            parsed = json.loads(raw_args)
+        except json.JSONDecodeError as exc:
+            raise VllmIntegrationError(
+                f"DRAFTSLICE_VLLM_SCREENER_ARGS is not valid JSON: {exc}"
+            ) from exc
+        if not isinstance(parsed, dict):
+            raise VllmIntegrationError(
+                "DRAFTSLICE_VLLM_SCREENER_ARGS must be a JSON object"
+            )
+        args = parsed
+    return ScreenerConfig(name=raw_name, args=args)
+
+
+def _screen_valid_sets(
+    valid_sets: list[TokenSet | None],
+    candidates: list[TokenSet],
+) -> ScreenedValidSets:
+    """Apply ``A := A ∩ V`` row by row.
+
+    Rows without an exact valid set (``None``) stay on the full-head fallback,
+    because there is no universe to intersect with. An empty intersection also
+    falls back to the full head instead of silently dropping every candidate.
+    """
+
+    if len(candidates) != len(valid_sets):
+        raise VllmIntegrationError(
+            f"screener returned {len(candidates)} rows for {len(valid_sets)} states"
+        )
+    screened: list[TokenSet | None] = []
+    rows = 0
+    dropped = 0
+    empty_rows = 0
+    for valid, candidate in zip(valid_sets, candidates, strict=True):
+        if valid is None:
+            screened.append(None)
+            continue
+        if not isinstance(candidate, TokenSet):
+            raise VllmIntegrationError("screener must return TokenSet rows")
+        selected = candidate.intersection(valid)
+        rows += 1
+        dropped += len(valid) - len(selected)
+        if selected.is_empty:
+            screened.append(None)
+            empty_rows += 1
+        else:
+            screened.append(selected)
+    return ScreenedValidSets(
+        sets=screened,
+        rows=rows,
+        dropped=dropped,
+        empty_rows=empty_rows,
+    )
+
+
+
 class DraftSliceSpeculatorMixin:
     """Mixin for vLLM EAGLE-3/MTP speculators.
 
@@ -185,6 +292,10 @@ class DraftSliceSpeculatorMixin:
         self._draftslice_dummy = False
         self._draftslice_weight: Any | None = None
         self._draftslice_weight_key: tuple[Any, ...] | None = None
+        self._draftslice_screener: Any | None = None
+        self._draftslice_screener_config: ScreenerConfig | None = None
+        self._draftslice_screener_ready = False
+
         if os.environ.get("DRAFTSLICE_VLLM_DEBUG") == "1":
             import sys
 
@@ -498,6 +609,73 @@ class DraftSliceSpeculatorMixin:
             for state in states
         ]
 
+    def _ensure_screener(self) -> None:
+        """Build the configured registry screener once per speculator."""
+
+        if self._draftslice_screener_ready:
+            return
+        self._draftslice_screener_ready = True
+        try:
+            config = _screener_config()
+        except Exception as exc:  # pragma: no cover - defensive
+            self._draftslice_stats.record_error(f"screener config: {exc}")
+            return
+        if config is None:
+            return
+        try:
+            from ..screen import get_screener
+
+            screener = get_screener(config.name, **config.args)
+        except Exception as exc:
+            self._draftslice_stats.record_error(
+                f"screener init {config.name!r}: {exc}"
+            )
+            return
+        self._draftslice_screener = screener
+        self._draftslice_screener_config = config
+        if os.environ.get("DRAFTSLICE_VLLM_DEBUG") == "1":
+            import sys
+
+            print(
+                f"[draftslice] screener={config.name!r} args={config.args} "
+                "(constrained: A := A ∩ V)",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    def _apply_screener(
+        self,
+        hidden_states: Any,
+        valid_sets: list[TokenSet | None],
+    ) -> list[TokenSet | None]:
+        """Intersect screened candidates with the exact valid sets.
+
+        This is constrained-calibrated semantics: only candidate selection is
+        approximate, and the intersection keeps every proposed draft token
+        inside the grammar. Any screener failure falls back to the exact sets.
+        """
+
+        self._ensure_screener()
+        screener = self._draftslice_screener
+        config = self._draftslice_screener_config
+        if screener is None or config is None:
+            return valid_sets
+        self._draftslice_stats.screener_name = config.name
+        t0 = time.perf_counter()
+        try:
+            candidates = screener.candidates(hidden_states)
+            result = _screen_valid_sets(valid_sets, candidates)
+        except Exception as exc:
+            self._draftslice_stats.screener_errors += 1
+            self._draftslice_stats.record_error(f"screener {config.name!r}: {exc}")
+            return valid_sets
+        _TIMING["screen"] += time.perf_counter() - t0
+        self._draftslice_stats.screener_calls += 1
+        self._draftslice_stats.screener_rows += result.rows
+        self._draftslice_stats.screener_dropped += result.dropped
+        self._draftslice_stats.screener_empty_rows += result.empty_rows
+        return result.sets
+
     def _lm_head_weight(self) -> Any | None:
         model = getattr(self, "model", None)
         if model is None:
@@ -566,6 +744,11 @@ class DraftSliceSpeculatorMixin:
         valid_sets = self._valid_sets_for_rows(hidden_states)
         if valid_sets is None or not any(token_set is not None for token_set in valid_sets):
             self._draftslice_stats.no_valid_sets_calls += 1
+            self._draftslice_stats.record(sliced=False)
+            return base_compute(hidden_states, spec_step_idx)
+
+        valid_sets = self._apply_screener(hidden_states, valid_sets)
+        if not any(token_set is not None for token_set in valid_sets):
             self._draftslice_stats.record(sliced=False)
             return base_compute(hidden_states, spec_step_idx)
 
@@ -770,6 +953,7 @@ def register() -> None:
 __all__ = [
     "DraftSliceSpeculatorMixin",
     "DraftSliceVllmStats",
+    "ScreenerConfig",
     "VllmIntegrationError",
     "register",
 ]

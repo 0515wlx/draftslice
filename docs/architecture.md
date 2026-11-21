@@ -40,6 +40,10 @@ Completed:
   `A := A ∩ V` for constrained-calibrated, keep `A` for free-form, reject a
   screener in strict mode, and fall back to the full head on empty/over-budget
   rows. The compiler and the offline baseline runner share the same protocol.
+  The vLLM adapter can opt into the same constrained intersection
+  (`DRAFTSLICE_VLLM_SCREENER`) on top of its worker-side grammar shadow, with
+  per-call candidate/drop counters and a full-head fallback on screener errors
+  or empty intersections.
 - xgrammar adapter for JSON Schema and regex sessions, including B3 trajectory
   recording.
 - B4 vLLM end-to-end runner (`draftslice bench e2e`) and a first
@@ -51,8 +55,9 @@ Still open (details in §18):
 
 - stable cross-request xgrammar state hashing and a full grammar replay corpus;
 - optimized TP sharding and quantized LM-head paths (safe fallbacks exist);
-- wiring `screen.registry` sources into the vLLM adapter (it still slices only
-  from the grammar shadow);
+- wiring `screen.registry` sources into the vLLM adapter (the constrained
+  intersection is implemented; free-form calibrated modes and artifact loading
+  are not);
 - the DFlash per-block adapter and the SGLang draft-path hook;
 - calibrated end-to-end runs on the full dataset mix;
 - the release benchmark with one-command reproduction.
@@ -1100,6 +1105,15 @@ For each batch row with a captured valid set:
 The logits processor's `scale` and `soft_cap` are applied to the sliced values so
 the draft distribution matches the full-head path.
 
+When `DRAFTSLICE_VLLM_SCREENER` names a registry source, the adapter first asks
+that source for candidates on the draft hidden states and then intersects them
+with the exact valid set for each row (`A := A ∩ V`). Only candidate selection is
+approximate; every proposed draft token is still grammar-valid and the target
+verifier remains exact. Rows without an exact set, screener failures, and empty
+intersections fall back to the full head. The counters
+(`screener_calls`, `screener_rows`, `screener_dropped`, `screener_empty_rows`,
+`screener_errors`) are exposed through `draftslice_stats()`.
+
 ### 16.3 Safety fallbacks
 
 The integration falls back to the full draft head when any of the following is
@@ -1113,6 +1127,8 @@ true:
 - the weight dtype is not bf16/fp16/fp32;
 - the logits processor has `logits_as_input=True`;
 - the valid set is empty or larger than `DRAFTSLICE_VLLM_MAX_ROWS`;
+- the configured screener cannot be built or raises on `candidates()`;
+- the intersection of the screener candidates with the valid set is empty;
 - any exception occurs during plan construction or kernel execution.
 
 `DRAFTSLICE_VLLM_DEBUG=1` prints per-speculator call/slice/fallback counters to
@@ -1157,6 +1173,11 @@ Environment controls:
 - `DRAFTSLICE_VLLM=0` disables slicing and keeps the wrapper as a pass-through.
 - `DRAFTSLICE_VLLM_SLICE=1` enables the experimental draft-step-0 slice path.
 - `DRAFTSLICE_VLLM_MAX_ROWS` caps the strict slice size (default 32768).
+- `DRAFTSLICE_VLLM_SCREENER` names an opt-in `screen.registry` source (for
+  example `static`, `group`, `lowrank`, `router`, `svd_lowrank`); candidates are
+  intersected with the exact grammar set. Empty/unset means off.
+- `DRAFTSLICE_VLLM_SCREENER_ARGS` is a JSON object passed to the screener
+  factory (for example `'{"rows": [1, 2, 3]}'` for `static`).
 - `DRAFTSLICE_VLLM_CUDA_GRAPH=1` enables the kernel-level graph replay cache. It
   is opt-in because capture must not run inside the engine's own graph capture;
   capture failure falls back to eager.
@@ -1291,9 +1312,12 @@ an engine adapter.
 The partition builder, split-conformal calibrator, artifact bundle,
 `compile_calibrated`, the `screen.registry` (full/static/low-rank/group/router/
 CFHead/FlashHead/VocabTrim), and `compile_screened` / `compile_step(screener=...)`
-are implemented. The remaining work is router training on group marginals,
-candidate-set cache wiring for screened plans, the vLLM screener hook, and the
-`constrained_calibrated` / `freeform_calibrated` end-to-end modes.
+are implemented. The vLLM adapter now has an opt-in constrained screener hook
+(`DRAFTSLICE_VLLM_SCREENER` + JSON args) that computes `A ∩ V` per row and falls
+back to the full head on errors or empty intersections. The remaining work is
+router training on group marginals, candidate-set cache wiring for screened
+plans, artifact loading for the vLLM hook, and the `constrained_calibrated` /
+`freeform_calibrated` end-to-end modes.
 
 ### 18.4 vLLM hardening
 
@@ -1302,7 +1326,8 @@ candidate-set cache wiring for screened plans, the vLLM screener hook, and the
 - Support quantized LM heads through the quant method, not raw weights.
 - Validate grammar-state timing against real structured traces.
 - Wire `screen.registry` sources (static/low-rank/group/router) into the
-  draft-logits hook; the current adapter only uses the grammar shadow.
+  draft-logits hook; the constrained `A ∩ V` hook is implemented, but artifact
+  loading/calibration identity and free-form mode are not.
 - CUDA graph buckets for dynamic candidate sizes. The kernel-level
   `CudaGraphCache` exists; the adapter must still keep a stable hidden workspace
   and row buffer.

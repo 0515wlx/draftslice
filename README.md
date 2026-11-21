@@ -22,8 +22,9 @@ caches, union/tree executor, acceptance-aware scheduler), a unified screener
 registry and screened plan compilation (strict, constrained-calibrated, and
 free-form calibrated), fixed-clock Torch/Triton kernels with shape dispatch,
 CUDA-graph replay and opt-in autotuning, an xgrammar constraint adapter with B3
-replay, a vLLM plugin with a strict constrained draft path and a per-position
-grammar shadow, a B4 end-to-end runner, and a fair offline baseline suite
+replay, a vLLM plugin with a strict constrained draft path, a per-position
+grammar shadow, and an opt-in constrained screener hook, a B4 end-to-end runner,
+and a fair offline baseline suite
 including CFHead/FlashHead/VocabTrim-style reference policies. The public DFlash draft
 `z-lab/Qwen3.5-4B-DFlash` is verified with vLLM's built-in `dflash` path;
 DraftSlice's DFlash adapter is future work. The calibrated screener training,
