@@ -47,6 +47,47 @@ def test_config_validates_and_selects_cases() -> None:
     assert E2EConfig(model="m", tensor_parallel_size=2).tensor_parallel_size == 2
 
 
+def test_calibrated_modes_require_and_export_a_screener() -> None:
+    with pytest.raises(ValueError):
+        E2EConfig(model="m", mode="constrained_calibrated")
+    with pytest.raises(ValueError):
+        E2EConfig(model="m", mode="strict", screener="static")
+    # screener_args is allowed with a name, not with an artifact alone
+    E2EConfig(
+        model="m",
+        mode="freeform_calibrated",
+        screener="static",
+        screener_args='{"rows":[1]}',
+    )
+    with pytest.raises(ValueError):
+        E2EConfig(
+            model="m",
+            mode="freeform_calibrated",
+            screener_artifact="/tmp/x",
+            screener_args="{}",
+        )
+
+    constrained = E2EConfig(
+        model="m",
+        mode="constrained_calibrated",
+        screener="static",
+        screener_args='{"rows":[1]}',
+    )
+    assert constrained.screener_env() == {
+        "DRAFTSLICE_VLLM_SLICE": "1",
+        "DRAFTSLICE_VLLM_SCREENER": "static",
+        "DRAFTSLICE_VLLM_SCREENER_ARGS": '{"rows":[1]}',
+        "DRAFTSLICE_VLLM_SCREENER_UNIVERSE": "valid",
+    }
+    freeform = E2EConfig(
+        model="m",
+        mode="freeform_calibrated",
+        screener_artifact="/tmp/bundle",
+    )
+    assert freeform.screener_env()["DRAFTSLICE_VLLM_SCREENER_UNIVERSE"] == "vocab"
+    assert E2EConfig(model="m").screener_env() == {}
+
+
 def test_default_cases_are_unique_and_well_formed() -> None:
     names = [case.name for case in DEFAULT_CASES]
     assert len(names) == len(set(names))

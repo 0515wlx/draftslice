@@ -160,10 +160,24 @@ class E2EConfig:
     warmup: int = 1
     repetitions: int = 1
     case_names: tuple[str, ...] | None = None
+    mode: str = "strict"
+    screener: str | None = None
+    screener_args: str | None = None
+    screener_artifact: str | None = None
 
     def __post_init__(self) -> None:
         if not self.model:
             raise ValueError("model must not be empty")
+        if self.mode not in ("strict", "constrained_calibrated", "freeform_calibrated"):
+            raise ValueError(
+                "mode must be strict, constrained_calibrated, or freeform_calibrated"
+            )
+        if self.mode != "strict" and not (self.screener or self.screener_artifact):
+            raise ValueError(f"{self.mode} requires a screener or screener_artifact")
+        if self.mode == "strict" and (self.screener or self.screener_artifact):
+            raise ValueError("strict mode must not configure a screener")
+        if self.screener_args is not None and self.screener is None:
+            raise ValueError("screener_args requires screener")
         if not self.methods:
             raise ValueError("methods must not be empty")
         if not self.batch_sizes or any(batch <= 0 for batch in self.batch_sizes):
@@ -188,6 +202,23 @@ class E2EConfig:
         if self.case_names is None:
             return DEFAULT_CASES
         return tuple(case for case in DEFAULT_CASES if case.name in self.case_names)
+
+    def screener_env(self) -> dict[str, str]:
+        """Environment overlay consumed by the vLLM plugin at construction."""
+
+        if self.mode == "strict":
+            return {}
+        env = {"DRAFTSLICE_VLLM_SLICE": "1"}
+        if self.screener_artifact:
+            env["DRAFTSLICE_VLLM_SCREENER_ARTIFACT"] = self.screener_artifact
+        if self.screener:
+            env["DRAFTSLICE_VLLM_SCREENER"] = self.screener
+        if self.screener_args:
+            env["DRAFTSLICE_VLLM_SCREENER_ARGS"] = self.screener_args
+        env["DRAFTSLICE_VLLM_SCREENER_UNIVERSE"] = (
+            "valid" if self.mode == "constrained_calibrated" else "vocab"
+        )
+        return env
 
 
 def _metric_value(sample: Any) -> float | None:
@@ -301,7 +332,19 @@ def _build_llm(config: E2EConfig, method: str) -> Any:
         kwargs["spec_tokens"] = config.spec_tokens
         if config.draft_model is not None:
             kwargs["spec_model"] = config.draft_model
-    return LLM(**kwargs)
+    overlay = config.screener_env()
+    if not overlay:
+        return LLM(**kwargs)
+    previous = {key: os.environ.get(key) for key in overlay}
+    try:
+        os.environ.update(overlay)
+        return LLM(**kwargs)
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def _case_max_tokens(case: PromptCase, config: E2EConfig) -> int:

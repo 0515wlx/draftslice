@@ -335,6 +335,10 @@ draftslice bench constraint --schema schema.json \
   --tokenizer /path/to/model --max-steps 64 --out runs/b3_xgrammar.json
 
 # B4 end-to-end; run one method per process for isolation.
+# Calibrated modes set the vLLM screener env for that run.
+DRAFTSLICE_DATA_ROOT=... draftslice bench e2e --model "$MODEL" \
+  --method draftslice_mtp --mode constrained_calibrated \
+  --screener static --screener-args '{"rows":[1,2,3]}' --out runs/e2e.json
 draftslice bench e2e --model /path/to/model --method mtp \
   --batch 1,8 --out runs/b4_mtp.json
 draftslice bench e2e --model /path/to/model --method draftslice_mtp \

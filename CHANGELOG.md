@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Add explicit B4 calibrated modes: `draftslice bench e2e --mode
+  constrained_calibrated|freeform_calibrated --screener ... --screener-args ...`
+  configures the vLLM screener for that run, and `E2EConfig.screener_env()`
+  exports/restores the overlay around engine construction. Strict mode rejects a
+  screener so a benchmark label cannot silently mean approximate screening.
 - Add M5 screener tooling: `screen.router` trains an MLP group router from
   teacher logits or observed tokens; `screen.artifacts` serializes
   full/static/group/router/low-rank screeners into verified `screener/1`

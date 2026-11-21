@@ -228,6 +228,15 @@ def build_parser() -> argparse.ArgumentParser:
     e2e.add_argument("--warmup", type=int, default=1)
     e2e.add_argument("--repetitions", type=int, default=1)
     e2e.add_argument("--enforce-eager", action="store_true")
+    e2e.add_argument(
+        "--mode",
+        choices=("strict", "constrained_calibrated", "freeform_calibrated"),
+        default="strict",
+        help="Draft-head mode for draftslice methods.",
+    )
+    e2e.add_argument("--screener", default=None, help="Registered screener name.")
+    e2e.add_argument("--screener-args", default=None, help="JSON kwargs.")
+    e2e.add_argument("--screener-artifact", default=None, help="Bundle directory.")
 
     factorial = bench_sub.add_parser(
         "factorial",
@@ -551,6 +560,10 @@ def _bench_e2e(args: argparse.Namespace) -> int:
             warmup=args.warmup,
             repetitions=args.repetitions,
             case_names=cases,
+            mode=args.mode,
+            screener=args.screener,
+            screener_args=args.screener_args,
+            screener_artifact=args.screener_artifact,
         )
     except ValueError as exc:
         print(f"draftslice bench e2e: {exc}")
