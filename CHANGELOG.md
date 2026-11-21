@@ -36,9 +36,9 @@
   `sglang.srt.plugins`, slices draft block position 0 from the per-request
   grammar mask through the shared row kernel, and keeps later positions full.
   Unsupported heads and missing/oversized grammars fall back to the original
-  head; `DRAFTSLICE_SGLANG=1` enables the hook. Unit and real-kernel masking
-  tests pass; a real EAGLE engine run is not possible because the reference
-  environment has no EAGLE draft checkpoint.
+  head; `DRAFTSLICE_SGLANG=1` enables the hook. Validated end to end with SGLang
+  0.5.23 + Qwen3.5-0.8B built-in MTP: step-0 slicing fires, structured JSON is
+  valid, and greedy output ids match the hook-off run.
 - Enable DFlash block-position-0 slicing in the vLLM adapter. Later block
   positions stay on the full head because their grammar state depends on tokens
   sampled inside the same parallel block. Validated with Qwen3.5-4B +

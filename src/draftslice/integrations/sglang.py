@@ -214,7 +214,8 @@ def _sliceable_weight(lm_head: Any) -> Any | None:
         return None
     if getattr(lm_head, "tp_size", 1) != 1:
         return None
-    if getattr(lm_head, "quant_method", None) is not None:
+    quant_method = getattr(lm_head, "quant_method", None)
+    if quant_method is not None and "unquant" not in type(quant_method).__name__.lower():
         return None
     num_embeddings = getattr(lm_head, "num_embeddings", None)
     if num_embeddings is not None and int(num_embeddings) != int(weight.shape[0]):
@@ -250,6 +251,21 @@ def _patched_compute_lm_head(
     weight = _sliceable_weight(lm_head)
     if weight is None:
         _STATS["fallback_calls"] += 1
+        if os.environ.get("DRAFTSLICE_SGLANG_DEBUG") == "1":
+            import sys
+
+            raw_weight = getattr(lm_head, "weight", None)
+            print(
+                "[draftslice:sglang] step0 fallback: unsupported LM head "
+                f"type={type(lm_head).__name__} "
+                f"device={getattr(raw_weight, 'device', None)} "
+                f"shape={getattr(raw_weight, 'shape', None)} "
+                f"tp_size={getattr(lm_head, 'tp_size', None)} "
+                f"num_embeddings={getattr(lm_head, 'num_embeddings', None)} "
+                f"quant={getattr(lm_head, 'quant_method', None)}",
+                file=sys.stderr,
+                flush=True,
+            )
         return _ORIGINAL_LM_HEAD(
             self, hidden_states, lm_head, embedding_bias, out=out
         )
@@ -267,6 +283,14 @@ def _patched_compute_lm_head(
     )
     if candidates is None:
         _STATS["fallback_calls"] += 1
+        if os.environ.get("DRAFTSLICE_SGLANG_DEBUG") == "1":
+            import sys
+
+            print(
+                "[draftslice:sglang] step0 fallback: no candidates",
+                file=sys.stderr,
+                flush=True,
+            )
         return _ORIGINAL_LM_HEAD(
             self, hidden_states, lm_head, embedding_bias, out=out
         )
@@ -315,10 +339,26 @@ def _patched_draft(self: Any, batch: Any, *args: Any, **kwargs: Any) -> Any:
         raise SglangIntegrationError("SGLang draft hook is not installed")
     config = config_from_env()
     grammars = (
-        getattr(getattr(batch, "sampling_info", None), "grammars", None)
+        [getattr(req, "grammar", None) for req in getattr(batch, "reqs", ())]
         if config.enabled and getattr(batch, "has_grammar", False)
         else None
     )
+    if not grammars:
+        grammars = (
+            getattr(getattr(batch, "sampling_info", None), "grammars", None)
+            if config.enabled and getattr(batch, "has_grammar", False)
+            else None
+        )
+    if os.environ.get("DRAFTSLICE_SGLANG_DEBUG") == "1":
+        import sys
+
+        print(
+            f"[draftslice:sglang] draft hook enabled={config.enabled} "
+            f"has_grammar={getattr(batch, 'has_grammar', False)} "
+            f"grammars={0 if not grammars else len(grammars)}",
+            file=sys.stderr,
+            flush=True,
+        )
     state = (
         {
             "grammars": grammars,

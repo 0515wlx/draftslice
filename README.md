@@ -29,8 +29,8 @@ including CFHead/FlashHead/VocabTrim-style reference policies. M5 tooling now
 includes group-marginal router training, verified screener artifacts, a
 factorial evaluator, and screened-plan cache keys; M6
 includes hashed release manifests, Markdown reports, B5 comparison, and an
-SGLang general-plugin hook (draft block position 0, unit/kernel validated; no
-EAGLE draft checkpoint is available for a real engine run). The vLLM DFlash
+SGLang general-plugin hook (draft block position 0, validated end to end with
+Qwen3.5 built-in MTP). The vLLM DFlash
 adapter slices block position 0 exactly and has a real Qwen3.5-4B run. The
 public DFlash draft
 `z-lab/Qwen3.5-4B-DFlash` is verified with vLLM's built-in `dflash` path;
@@ -166,8 +166,8 @@ block-position slicing is not enabled. See
   policies), artifact/partition/conformal core, calibrated plan compilation,
   the acceptance model, router training, screener artifacts, and the factorial
   matrix (implemented); published multi-seed calibrated runs next
-- **M6** SGLang general-plugin hook (draft block position 0; import/kernel
-  validated, real EAGLE run blocked by a missing draft checkpoint), DFlash
+- **M6** SGLang general-plugin hook (draft block position 0, validated with
+  Qwen3.5 built-in MTP), DFlash
   block-position-0 slicing (real 4B run), release manifests, reports, B5
   comparison, and CI gates (implemented); per-position DFlash and multi-seed
   release run next

@@ -56,11 +56,12 @@ Completed:
   workload matrix with coverage and candidate-cost cells.
 - M6 release tooling: `bench.release` writes hashed release manifests and
   Markdown reports for every implemented result schema, verifies hashes, and
-  compares releases for B5 regressions. The SGLang adapter is a real general
+  comparable releases for B5 regressions. The SGLang adapter is a real general
   plugin: it slices draft block position 0 from the per-request grammar mask and
   keeps later positions on the full head. The vLLM DFlash adapter does the same
   for block position 0 with the exact worker shadow; later block positions stay
-  full. Both paths are unit-tested, and DFlash has a real 4B end-to-end run.
+  full. Both paths are unit-tested and have real-engine runs (SGLang 0.5.23
+  Qwen3.5-0.8B MTP; vLLM Qwen3.5-4B + 4B-DFlash).
 - xgrammar adapter for JSON Schema and regex sessions, including B3 trajectory
   recording.
 - B4 vLLM end-to-end runner (`draftslice bench e2e`) and a first
@@ -76,8 +77,8 @@ Still open (details in §18):
   not available before sampling);
 - calibrated end-to-end runs on the full dataset mix and a multi-seed release
   run on the reference hardware;
-- real-engine SGLang validation (the plugin path is implemented and tested, but
-  no EAGLE draft checkpoint is available in the reference environment).
+- real-engine SGLang validation is complete for Qwen3.5 built-in MTP; validate
+  additional SGLang model families and TP > 1 as follow-up.
 
 
 ## 1. What we are building
@@ -1028,12 +1029,11 @@ DoD:
 - B1–B4 release run, multi-seed, report generator.
 - CI/nightly/release gates.
 
-Implemented so far: the SGLang general-plugin hook (draft block position 0),
-the DFlash block-position-0 slice in vLLM, the factorial B1 matrix, hashed
-release manifests and Markdown reports for every result schema, B5 manifest
-comparison, and nightly/release workflows. The SGLang EAGLE path is tested at
-the unit/kernel level but lacks a real draft checkpoint in the reference
-environment; multi-seed B1–B4 results are operator data.
+Implemented so far: the SGLang general-plugin hook (draft block position 0,
+validated end to end with Qwen3.5 built-in MTP), the DFlash block-position-0
+slice in vLLM, the factorial B1 matrix, hashed release manifests and Markdown
+reports for every result schema, B5 manifest comparison, and nightly/release
+workflows. Multi-seed B1–B4 results are operator data.
 
 DoD:
 
@@ -1415,13 +1415,13 @@ one node per block position, each node carrying its own `HeadPlan`.
   `EagleDraftWorker.draft` / `FrozenKVMTPDraftWorker.draft` to publish the batch
   grammar state, and `LogitsProcessor._compute_lm_head` to slice draft block
   position 0 through the shared row kernel. Later positions use the full head.
-- Unsupported heads (TP > 1, quantized, CPU weight), missing/terminated grammars,
-  oversized valid sets, and any error fall back to the original full head.
-- Unit tests cover the context/step logic and a real-kernel masking path.
-  End-to-end validation with a real SGLang EAGLE run is not possible in the
-  reference environment because no EAGLE draft checkpoint is available; the
-  `FROZEN_KV_MTP` path in SGLang 0.5.23 rejects the Qwen3.5-0.8B target before
-  drafting starts.
+- Unsupported heads (TP > 1, non-unquantized, CPU weight), missing/terminated
+  grammars, oversized valid sets, and any error fall back to the original full
+  head.
+- End-to-end validated with SGLang 0.5.23 + Qwen3.5-0.8B and its built-in MTP
+  (`speculative_algorithm="EAGLE"`, `speculative_draft_model_path` = target):
+  step-0 slicing fires (`sliced_calls > 0`, candidates 2..443), structured JSON
+  output is valid, and greedy output ids are identical with the hook on/off.
 - The pure `screen_logits` helper remains available for hosts that prefer a
   post-head mask.
 
