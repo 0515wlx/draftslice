@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Split development into three verified environments because vLLM 0.34 and
+  SGLang 0.5.23 pin incompatible torch/xgrammar/flashinfer stacks:
+  `wlx_draftslice` (engine-free), `wlx_draftslice_vllm`, and
+  `wlx_draftslice_sglang`. Add `requirements-base.txt`, `requirements.txt`,
+  `requirements-sglang.txt`, exact `*.lock.txt` files, `scripts/setup_envs.sh`,
+  `scripts/verify_env.sh`, and `docs/environment.md`. All three environments
+  pass `pip check` and the project test suite.
 - Add explicit B4 calibrated modes: `draftslice bench e2e --mode
   constrained_calibrated|freeform_calibrated --screener ... --screener-args ...`
   configures the vLLM screener for that run, and `E2EConfig.screener_env()`
@@ -26,8 +33,9 @@
   `bench compare`. Add nightly/release workflows and an engine-free smoke
   pipeline.
 - Add the SGLang boundary (`integrations/sglang.py`): a tested candidate
-  transform and guarded registration. The engine hook is not validated because
-  the reference SGLang install is missing `sgl_kernel`.
+  transform and guarded registration against SGLang 0.5.23 `eagle_worker_v2`.
+  The draft-path hook is still not wired because it needs per-request grammar
+  state.
 - Add an opt-in vLLM screener hook. `DRAFTSLICE_VLLM_SCREENER` names a
   `screen.registry` source and `DRAFTSLICE_VLLM_SCREENER_ARGS` supplies its JSON
   kwargs; the adapter intersects candidates with the exact worker-side grammar

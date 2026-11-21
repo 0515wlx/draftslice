@@ -29,8 +29,8 @@ including CFHead/FlashHead/VocabTrim-style reference policies. M5 tooling now
 includes group-marginal router training, verified screener artifacts, a
 factorial evaluator, and screened-plan cache keys; M6
 includes hashed release manifests, Markdown reports, B5 comparison, and an
-SGLang boundary (engine validation is blocked by a missing `sgl_kernel` in the
-reference install). The public DFlash draft
+SGLang boundary (validated against SGLang 0.5.23 imports; the draft-path hook
+still needs a per-request grammar-state provider). The public DFlash draft
 `z-lab/Qwen3.5-4B-DFlash` is verified with vLLM's built-in `dflash` path;
 DraftSlice's DFlash adapter is future work. The remaining release work is a
 multi-seed result run on the prescribed datasets and validation of the SGLang
@@ -164,10 +164,10 @@ block-position slicing is not enabled. See
   policies), artifact/partition/conformal core, calibrated plan compilation,
   the acceptance model, router training, screener artifacts, and the factorial
   matrix (implemented); published multi-seed calibrated runs next
-- **M6** SGLang boundary (implemented; engine validation blocked), DFlash
-  per-block adapter (blocked on per-position grammar state), release manifests,
-  reports, B5 comparison, and CI gates (implemented); multi-seed release run
-  next
+- **M6** SGLang boundary (implemented and import-validated; draft-path hook
+  still needs per-request grammar state), DFlash per-block adapter (blocked on
+  per-position grammar state), release manifests, reports, B5 comparison, and CI
+  gates (implemented); multi-seed release run next
 
 Each milestone has a definition of done in
 [docs/architecture.md](docs/architecture.md); the benchmark gates are in
@@ -180,6 +180,24 @@ Each milestone has a definition of done in
 - vLLM context-aware sparse LM head — <https://github.com/vllm-project/vllm/pull/67897>
 - Grammar-aware draft sampling in vLLM — <https://github.com/vllm-project/vllm/pull/47885>
 - CASD: contract-aware speculative decoding — <https://www.computer.org/csdl/proceedings-article/sse/2026/119800a290/2joOwwfu2Ji>
+
+## Development environments
+
+vLLM and SGLang pin different `torch` patch releases, so they cannot share one
+Python environment. The repository ships one main environment and two engine
+siblings:
+
+```bash
+bash scripts/setup_envs.sh          # wlx_draftslice + _vllm + _sglang
+# or install one at a time:
+pip install -r requirements-base.txt    # wlx_draftslice (no engine)
+pip install -r requirements.txt         # wlx_draftslice_vllm (vLLM 0.34.0)
+pip install -r requirements-sglang.txt  # wlx_draftslice_sglang (SGLang 0.5.23)
+```
+
+See [docs/environment.md](docs/environment.md) for the pin matrix, exact lock
+files, and the `pip check`/test gates. Run `bash scripts/verify_env.sh` to
+validate all three environments in one command.
 
 ## Contributing
 

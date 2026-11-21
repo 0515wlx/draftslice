@@ -1,0 +1,36 @@
+# Alternative development environment: SGLang 0.5.23.
+#
+# SGLang and vLLM cannot share one Python environment: sglang 0.5.23 requires
+# torch==2.14.1, while vllm 0.34.0 requires torch==2.14.0, and their
+# xgrammar/flashinfer/compressed-tensors/tokenizers pins also differ. Use this
+# file in a separate conda env; see docs/environment.md.
+#
+# Refresh the exact lock with:
+#   conda run -n wlx_draftslice_sglang python -m pip freeze --exclude-editable \
+#     > requirements-sglang.lock.txt
+
+sglang==0.5.23
+
+# Engine-critical pins (match sglang 0.5.23 metadata; vLLM differs).
+torch==2.14.1
+torchvision
+torchaudio==2.11.0
+torchcodec==0.17.0
+transformers==5.19.0
+tokenizers==0.23.2
+xgrammar==0.2.7
+flashinfer-python[cu13]==0.7.2
+compressed-tensors==0.18.0
+humming-kernels[cu13]==0.1.12
+numba==0.65.1
+openai==2.8.0
+sglang-kernel==0.4.10
+kernels>=0.14.1,<0.15
+quack-kernels==0.6.5
+flash-attn-4==4.0.0b40
+torch_memory_saver>=0.0.9.post1
+
+# Project runtime + tests.
+numpy>=1.24
+pytest>=8
+ruff>=0.6

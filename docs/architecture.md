@@ -58,8 +58,9 @@ Completed:
   Markdown reports for every implemented result schema, verifies hashes, and
   compares releases for B5 regressions. The SGLang adapter boundary is
   implemented and tested as a pure candidate transform; runtime registration is
-  gated on a complete SGLang install (the reference environment lacks
-  `sgl_kernel`).
+  gated on an importable SGLang EAGLE worker (validated against 0.5.23
+  `eagle_worker_v2`; the engine hook still needs a per-request grammar-state
+  provider).
 - xgrammar adapter for JSON Schema and regex sessions, including B3 trajectory
   recording.
 - B4 vLLM end-to-end runner (`draftslice bench e2e`) and a first
@@ -74,8 +75,8 @@ Still open (details in §18):
 - the DFlash per-block adapter (block-position grammar state is not available);
 - calibrated end-to-end runs on the full dataset mix and a multi-seed release
   run on the reference hardware;
-- SGLang runtime validation (the boundary is implemented, but the reference
-  SGLang install is missing `sgl_kernel`).
+- SGLang engine-hook validation (the boundary imports SGLang 0.5.23, but the
+  draft-path hook still needs a per-request grammar-state provider).
 
 
 ## 1. What we are building
@@ -1029,9 +1030,9 @@ DoD:
 Implemented so far: the SGLang candidate transform and guarded boundary, the
 factorial B1 matrix, hashed release manifests and Markdown reports for every
 result schema, B5 manifest comparison, and nightly/release workflows that run
-the offline pipeline. The SGLang engine hook is not validated because the
-reference install lacks `sgl_kernel`; multi-seed B1–B4 results are operator data,
-not repository content.
+the offline pipeline. The SGLang engine hook is not wired to the draft path yet
+(the boundary imports SGLang 0.5.23 and its `eagle_worker_v2`); multi-seed B1–B4
+results are operator data, not repository content.
 
 DoD:
 
@@ -1407,8 +1408,9 @@ benchmark compares built-in `dflash` at block sizes 8 and 16 against
 - The candidate transform (`integrations/sglang.screen_logits`) and environment
   boundary are implemented and unit-tested. `register()` refuses to claim an
   engine hook when SGLang's speculative worker cannot be imported.
-- Runtime status: the reference environment has SGLang 0.5.2 but lacks
-  `sgl_kernel`, so the EAGLE worker hook has not been validated end to end.
+- Runtime status: the boundary imports SGLang 0.5.23 and its
+  `eagle_worker_v2` in the sibling environment. The draft-path hook has not
+  been validated end to end because it still needs per-request grammar state.
 - The host hook wraps the draft head (or masks captured logits) with
   `screen_logits`, and falls back to the full head when per-request grammar
   state is absent. Reuse the plan/compiler/executor contracts; only the

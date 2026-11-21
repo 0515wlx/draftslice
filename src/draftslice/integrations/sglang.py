@@ -5,12 +5,11 @@ SGLang's EAGLE worker captures draft logits in
 DraftSlice boundary is deliberately smaller than the vLLM adapter: it provides
 the candidate-set transform and a guarded registration entry point.
 
-Runtime status: the installed SGLang build in the reference environment is
-missing ``sgl_kernel``, so the engine hook has not been validated end to end.
-The pure transform below is tested; ``register()`` raises a clear error instead
-of pretending the engine path is available. The intended engine hook is to run
-the draft LM head on a ``HeadPlan`` row set (not to mask logits after the full
-head), and to keep the full head when no per-request grammar state exists.
+Runtime status: the boundary and imports are validated against SGLang 0.5.23
+(``eagle_worker_v2``). The engine hook still needs a per-request grammar-state
+provider: it must run the draft LM head on a ``HeadPlan`` row set (not mask
+logits after the full head), and keep the full head when no state exists.
+``register()`` only claims availability after the speculative worker imports.
 """
 
 from __future__ import annotations
@@ -117,10 +116,19 @@ def _sglang_status() -> tuple[bool, str]:
     except ImportError as exc:
         return False, f"sglang is not installed: {exc}"
     try:
-        import sglang.srt.speculative.eagle_worker  # noqa: F401
-    except Exception as exc:  # missing sgl_kernel is the common case
-        return False, f"sglang speculative worker is unavailable: {exc}"
-    return True, ""
+        import sglang.srt.speculative.spec_info  # noqa: F401
+    except Exception as exc:
+        return False, f"sglang speculative interfaces are unavailable: {exc}"
+    for module in (
+        "sglang.srt.speculative.eagle_worker_v2",
+        "sglang.srt.speculative.eagle_worker",
+    ):
+        try:
+            __import__(module)
+            return True, ""
+        except Exception:
+            continue
+    return False, "sglang has no importable EAGLE draft worker"
 
 
 def register() -> None:
@@ -139,8 +147,8 @@ def register() -> None:
     if not available:
         raise SglangIntegrationError(
             f"DraftSlice SGLang boundary is unavailable: {reason}. "
-            "Install a complete SGLang build (including sgl_kernel) before "
-            "enabling the engine hook."
+            "Install a complete SGLang build with an importable EAGLE worker "
+            "before enabling the engine hook."
         )
     _REGISTERED = True
 

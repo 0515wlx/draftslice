@@ -1,0 +1,32 @@
+# Default development environment: vLLM 0.34.0.
+#
+# This file is the vLLM stack. SGLang deliberately pins a different torch
+# patch release, so it lives in a separate environment; see
+# requirements-sglang.txt and docs/environment.md.
+#
+# Refresh the exact lock with:
+#   conda run -n wlx_draftslice_vllm python -m pip freeze --exclude-editable \
+#     > requirements.lock.txt
+
+vllm==0.34.0
+
+# Engine-critical pins (match vllm 0.34.0 metadata; SGLang differs).
+torch==2.14.0
+torchvision==0.29.0
+torchaudio==2.11.0
+torchcodec>=0.14
+transformers>=5.16.1,<5.23.0
+tokenizers>=0.23.3
+xgrammar==0.2.8
+flashinfer-python==0.7.3
+compressed-tensors==0.17.0
+humming-kernels[cu13]==0.1.19
+numba==0.65.0
+openai>=2.25.0
+outlines_core==0.2.14
+quack-kernels==0.6.5
+
+# Project runtime + tests.
+numpy>=1.24
+pytest>=8
+ruff>=0.6

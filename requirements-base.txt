@@ -1,0 +1,12 @@
+# Main project environment: shared tooling, no inference engine.
+#
+# Use this environment for plan/kernel/cache tests and offline benchmarks.
+# Engine-specific work uses the sibling environments:
+#   wlx_draftslice_vllm    -> requirements.txt
+#   wlx_draftslice_sglang  -> requirements-sglang.txt
+
+torch==2.14.1
+numpy>=1.24
+jsonschema>=4
+pytest>=8
+ruff>=0.6
