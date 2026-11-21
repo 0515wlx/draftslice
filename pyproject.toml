@@ -51,6 +51,9 @@ draftslice = "draftslice.cli:main"
 [project.entry-points."vllm.general_plugins"]
 draftslice = "draftslice.integrations.vllm:register"
 
+[project.entry-points."sglang.srt.plugins"]
+draftslice = "draftslice.integrations.sglang:register"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 

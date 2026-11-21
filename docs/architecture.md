@@ -56,11 +56,11 @@ Completed:
   workload matrix with coverage and candidate-cost cells.
 - M6 release tooling: `bench.release` writes hashed release manifests and
   Markdown reports for every implemented result schema, verifies hashes, and
-  compares releases for B5 regressions. The SGLang adapter boundary is
-  implemented and tested as a pure candidate transform; runtime registration is
-  gated on an importable SGLang EAGLE worker (validated against 0.5.23
-  `eagle_worker_v2`; the engine hook still needs a per-request grammar-state
-  provider).
+  compares releases for B5 regressions. The SGLang adapter is a real general
+  plugin: it slices draft block position 0 from the per-request grammar mask and
+  keeps later positions on the full head. The vLLM DFlash adapter does the same
+  for block position 0 with the exact worker shadow; later block positions stay
+  full. Both paths are unit-tested, and DFlash has a real 4B end-to-end run.
 - xgrammar adapter for JSON Schema and regex sessions, including B3 trajectory
   recording.
 - B4 vLLM end-to-end runner (`draftslice bench e2e`) and a first
@@ -72,11 +72,12 @@ Still open (details in §18):
 
 - stable cross-request xgrammar state hashing and a full grammar replay corpus;
 - optimized TP sharding and quantized LM-head paths (safe fallbacks exist);
-- the DFlash per-block adapter (block-position grammar state is not available);
+- the DFlash per-block adapter for positions > 0 (block-position grammar state is
+  not available before sampling);
 - calibrated end-to-end runs on the full dataset mix and a multi-seed release
   run on the reference hardware;
-- SGLang engine-hook validation (the boundary imports SGLang 0.5.23, but the
-  draft-path hook still needs a per-request grammar-state provider).
+- real-engine SGLang validation (the plugin path is implemented and tested, but
+  no EAGLE draft checkpoint is available in the reference environment).
 
 
 ## 1. What we are building
@@ -1027,12 +1028,12 @@ DoD:
 - B1–B4 release run, multi-seed, report generator.
 - CI/nightly/release gates.
 
-Implemented so far: the SGLang candidate transform and guarded boundary, the
-factorial B1 matrix, hashed release manifests and Markdown reports for every
-result schema, B5 manifest comparison, and nightly/release workflows that run
-the offline pipeline. The SGLang engine hook is not wired to the draft path yet
-(the boundary imports SGLang 0.5.23 and its `eagle_worker_v2`); multi-seed B1–B4
-results are operator data, not repository content.
+Implemented so far: the SGLang general-plugin hook (draft block position 0),
+the DFlash block-position-0 slice in vLLM, the factorial B1 matrix, hashed
+release manifests and Markdown reports for every result schema, B5 manifest
+comparison, and nightly/release workflows. The SGLang EAGLE path is tested at
+the unit/kernel level but lacks a real draft checkpoint in the reference
+environment; multi-seed B1–B4 results are operator data.
 
 DoD:
 
@@ -1379,9 +1380,15 @@ model root and a vLLM `method="dflash"` smoke test has passed with a 8-token
 generation. vLLM 0.34 already ships `DFlashSpeculator` and
 `DFlashDraftModel`; SGLang also supports it.
 
-The DraftSlice adapter is registered as `draftslice_dflash` and is currently a
-safe pass-through. Block-position slicing requires per-position grammar state and
-is not enabled. The adapter must account for DFlash's **parallel block drafting**:
+The DraftSlice adapter is registered as `draftslice_dflash`. Block position 0
+is sliced with the exact worker-shadow valid set; positions 1..N-1 stay on the
+full head because their grammar state depends on draft tokens sampled later in
+the same block. This is a deliberate partial optimization: it never applies the
+position-0 candidate set to later positions, so no valid later-position token is
+dropped. The block path is validated by a real Qwen3.5-4B + 4B-DFlash run
+(`block_step0_rows` increments, validity 1.0).
+
+The adapter accounts for DFlash's **parallel block drafting**:
 
 - each request emits a bonus query plus one query per draft token;
 - the draft sample rows carry `sample_col = 0..N-1` and share a request state;
@@ -1389,34 +1396,34 @@ is not enabled. The adapter must account for DFlash's **parallel block drafting*
   `sample_draft` call per position.
 
 A single captured grammar bitmask is not enough to constrain every block
-position. The adapter must either:
+position. The implemented policy is:
 
-1. obtain a per-position grammar state / valid set from the scheduler or a
-   worker-side grammar shadow, or
-2. fall back to the full draft head until that state exists.
+1. position 0 uses the worker shadow's exact valid set;
+2. positions 1..N-1 use the full draft head;
+3. if the shadow has no exact set, the whole block uses the full head.
 
-Do not enable block-position slicing based only on position 0. The target
-verifier remains exact, but a wrong draft candidate set lowers acceptance and
-invalidates a "no valid draft token dropped" claim. The intended target design is
-a `StepPlan` with one node per block position, each node carrying its own
-`HeadPlan`; the union executor then deduplicates rows across the block. The
-benchmark compares built-in `dflash` at block sizes 8 and 16 against
-`draftslice_dflash` only after B4 validates the grammar-state mapping.
+Per-position slicing for positions > 0 remains future work. It needs a
+grammar-aware block sampler (or a scheduler-provided per-position state); do not
+apply the position-0 set to later positions. The target verifier remains exact,
+but a wrong draft candidate set lowers acceptance and invalidates a "no valid
+draft token dropped" claim. The longer-term target design is a `StepPlan` with
+one node per block position, each node carrying its own `HeadPlan`.
 
 ### 18.6 SGLang
 
-- The candidate transform (`integrations/sglang.screen_logits`) and environment
-  boundary are implemented and unit-tested. `register()` refuses to claim an
-  engine hook when SGLang's speculative worker cannot be imported.
-- Runtime status: the boundary imports SGLang 0.5.23 and its
-  `eagle_worker_v2` in the sibling environment. The draft-path hook has not
-  been validated end to end because it still needs per-request grammar state.
-- The host hook wraps the draft head (or masks captured logits) with
-  `screen_logits`, and falls back to the full head when per-request grammar
-  state is absent. Reuse the plan/compiler/executor contracts; only the
-  grammar-state and batching adapters should differ.
-- Add DFlash to the SGLang adapter using the same block-position plan contract
-  after the vLLM DFlash per-position state exists.
+- The integration installs as a real `sglang.srt.plugins` entry point and patches
+  `EagleDraftWorker.draft` / `FrozenKVMTPDraftWorker.draft` to publish the batch
+  grammar state, and `LogitsProcessor._compute_lm_head` to slice draft block
+  position 0 through the shared row kernel. Later positions use the full head.
+- Unsupported heads (TP > 1, quantized, CPU weight), missing/terminated grammars,
+  oversized valid sets, and any error fall back to the original full head.
+- Unit tests cover the context/step logic and a real-kernel masking path.
+  End-to-end validation with a real SGLang EAGLE run is not possible in the
+  reference environment because no EAGLE draft checkpoint is available; the
+  `FROZEN_KV_MTP` path in SGLang 0.5.23 rejects the Qwen3.5-0.8B target before
+  drafting starts.
+- The pure `screen_logits` helper remains available for hosts that prefer a
+  post-head mask.
 
 ### 18.7 Release benchmark
 

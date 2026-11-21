@@ -32,10 +32,17 @@
   supports B5 release comparison; CLI `bench report`, `bench validate`, and
   `bench compare`. Add nightly/release workflows and an engine-free smoke
   pipeline.
-- Add the SGLang boundary (`integrations/sglang.py`): a tested candidate
-  transform and guarded registration against SGLang 0.5.23 `eagle_worker_v2`.
-  The draft-path hook is still not wired because it needs per-request grammar
-  state.
+- Add the SGLang general plugin: `draftslice.integrations.sglang` installs via
+  `sglang.srt.plugins`, slices draft block position 0 from the per-request
+  grammar mask through the shared row kernel, and keeps later positions full.
+  Unsupported heads and missing/oversized grammars fall back to the original
+  head; `DRAFTSLICE_SGLANG=1` enables the hook. Unit and real-kernel masking
+  tests pass; a real EAGLE engine run is not possible because the reference
+  environment has no EAGLE draft checkpoint.
+- Enable DFlash block-position-0 slicing in the vLLM adapter. Later block
+  positions stay on the full head because their grammar state depends on tokens
+  sampled inside the same parallel block. Validated with Qwen3.5-4B +
+  Qwen3.5-4B-DFlash: `block_step0_rows` increments, validity 1.0.
 - Add an opt-in vLLM screener hook. `DRAFTSLICE_VLLM_SCREENER` names a
   `screen.registry` source and `DRAFTSLICE_VLLM_SCREENER_ARGS` supplies its JSON
   kwargs; the adapter intersects candidates with the exact worker-side grammar

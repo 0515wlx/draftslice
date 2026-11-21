@@ -29,13 +29,15 @@ including CFHead/FlashHead/VocabTrim-style reference policies. M5 tooling now
 includes group-marginal router training, verified screener artifacts, a
 factorial evaluator, and screened-plan cache keys; M6
 includes hashed release manifests, Markdown reports, B5 comparison, and an
-SGLang boundary (validated against SGLang 0.5.23 imports; the draft-path hook
-still needs a per-request grammar-state provider). The public DFlash draft
+SGLang general-plugin hook (draft block position 0, unit/kernel validated; no
+EAGLE draft checkpoint is available for a real engine run). The vLLM DFlash
+adapter slices block position 0 exactly and has a real Qwen3.5-4B run. The
+public DFlash draft
 `z-lab/Qwen3.5-4B-DFlash` is verified with vLLM's built-in `dflash` path;
-DraftSlice's DFlash adapter is future work. The remaining release work is a
-multi-seed result run on the prescribed datasets and validation of the SGLang
-engine hook. Research code, experimental data, and benchmark results are
-intentionally not part of this repository.
+per-position slicing after block position 0 is future work. The remaining
+release work is a multi-seed result run on the prescribed datasets and real
+SGLang EAGLE validation. Research code, experimental data, and benchmark results
+are intentionally not part of this repository.
 
 ## Scope
 
@@ -164,10 +166,11 @@ block-position slicing is not enabled. See
   policies), artifact/partition/conformal core, calibrated plan compilation,
   the acceptance model, router training, screener artifacts, and the factorial
   matrix (implemented); published multi-seed calibrated runs next
-- **M6** SGLang boundary (implemented and import-validated; draft-path hook
-  still needs per-request grammar state), DFlash per-block adapter (blocked on
-  per-position grammar state), release manifests, reports, B5 comparison, and CI
-  gates (implemented); multi-seed release run next
+- **M6** SGLang general-plugin hook (draft block position 0; import/kernel
+  validated, real EAGLE run blocked by a missing draft checkpoint), DFlash
+  block-position-0 slicing (real 4B run), release manifests, reports, B5
+  comparison, and CI gates (implemented); per-position DFlash and multi-seed
+  release run next
 
 Each milestone has a definition of done in
 [docs/architecture.md](docs/architecture.md); the benchmark gates are in

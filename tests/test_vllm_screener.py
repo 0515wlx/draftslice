@@ -230,12 +230,98 @@ def test_compute_draft_logits_freeform_screener(monkeypatch) -> None:
     assert speculator._draftslice_stats.screener_freeform_rows == batch
 
 
+def test_block_valid_sets_only_slice_position_zero() -> None:
+    class Shadow:
+        entries = {0: object()}
+
+        def has(self, state):
+            return state in self.entries
+
+        def valid_ids(self, state, *, step=0):
+            return TokenSet([1, 2]) if step == 0 else None
+
+    class Bare(DraftSliceSpeculatorMixin):
+        pass
+
+    speculator = Bare.__new__(Bare)
+    speculator._draftslice_stats = DraftSliceVllmStats()
+    speculator._draftslice_shadow = Shadow()
+    speculator._draftslice_idx_mapping = torch.tensor([0, 0, 1, 1])
+    speculator._draftslice_draft_step = torch.tensor([0, 1, 0, 1])
+
+    result = speculator._block_valid_sets(torch.zeros((4, 4)))
+    assert result == [TokenSet([1, 2]), None, None, None]
+    assert speculator._draftslice_stats.block_step0_rows == 1
+
+    speculator._draftslice_draft_step = None
+    assert speculator._block_valid_sets(torch.zeros((4, 4))) is None
+
+
+def test_compute_draft_logits_block_mode_keeps_later_positions_full(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    from draftslice.integrations import vllm_logits
+    from draftslice.kernels.torch import TorchGatherKernel
+
+    monkeypatch.setattr(vllm_logits, "_default_kernel", lambda: TorchGatherKernel())
+
+    class Shadow:
+        entries = {0: object()}
+
+        def has(self, state):
+            return state in self.entries
+
+        def valid_ids(self, state, *, step=0):
+            return TokenSet([1, 3]) if step == 0 else None
+
+    class FakeBase:
+        def compute_draft_logits(self, hidden_states, spec_step_idx):
+            return hidden_states @ self.weight.T
+
+    class Speculator(DraftSliceSpeculatorMixin, FakeBase):
+        _draftslice_block = True
+
+    vocab, dim = 16, 4
+    torch.manual_seed(2)
+    weight = torch.randn(vocab, dim)
+    hidden = torch.randn(2, dim)
+    speculator = Speculator.__new__(Speculator)
+    speculator.weight = weight
+    speculator.vocab_size = vocab
+    speculator.model = SimpleNamespace(
+        lm_head=SimpleNamespace(tp_size=1, quant_config=None, weight=weight),
+        logits_processor=None,
+    )
+    speculator._lm_head_weight = lambda: weight
+    speculator._draftslice_enabled = True
+    speculator._draftslice_slicing = True
+    speculator._draftslice_graph_replay = False
+    speculator._draftslice_dummy = False
+    speculator._draftslice_snapshot = None
+    speculator._draftslice_shadow = Shadow()
+    speculator._draftslice_idx_mapping = torch.tensor([0, 0])
+    speculator._draftslice_idx_mapping_np = None
+    speculator._draftslice_draft_step = torch.tensor([0, 1])
+    speculator._draftslice_spec_step = 0
+    speculator._draftslice_stats = DraftSliceVllmStats()
+    speculator._draftslice_screener = None
+    speculator._draftslice_screener_config = None
+    speculator._draftslice_screener_ready = True
+
+    logits = speculator.compute_draft_logits(hidden, 0)
+    expected_first = torch.full((vocab,), float("-inf"))
+    expected_first[[1, 3]] = hidden[0] @ weight[[1, 3]].T
+    torch.testing.assert_close(logits[0], expected_first)
+    torch.testing.assert_close(logits[1], hidden[1] @ weight.T)
+
+
 def test_apply_screener_failure_keeps_exact_sets() -> None:
     class Failing:
         name = "broken"
 
         def candidates(self, hidden_states):
             raise RuntimeError("boom")
+
 
     class Bare(DraftSliceSpeculatorMixin):
         pass

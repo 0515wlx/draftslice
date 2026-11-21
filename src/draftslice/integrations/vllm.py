@@ -67,6 +67,7 @@ class DraftSliceVllmStats:
     screener_dropped: int = 0
     screener_empty_rows: int = 0
     screener_freeform_rows: int = 0
+    block_step0_rows: int = 0
     screener_errors: int = 0
     mask_stride: int = 0
     last_error: str | None = None
@@ -112,6 +113,7 @@ class DraftSliceVllmStats:
             "screener_dropped": self.screener_dropped,
             "screener_empty_rows": self.screener_empty_rows,
             "screener_freeform_rows": self.screener_freeform_rows,
+            "block_step0_rows": self.block_step0_rows,
             "screener_errors": self.screener_errors,
             "mask_stride": self.mask_stride,
             "last_error": self.last_error,
@@ -300,6 +302,10 @@ class DraftSliceSpeculatorMixin:
     """
 
     _draftslice_allow_slicing = True
+    # DFlash gets logits for a whole parallel block in one call. Only block
+    # position 0 has an exact grammar state before sampling; later positions
+    # must stay on the full head.
+    _draftslice_block = False
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -331,6 +337,7 @@ class DraftSliceSpeculatorMixin:
         self._draftslice_screener: Any | None = None
         self._draftslice_screener_config: ScreenerConfig | None = None
         self._draftslice_screener_ready = False
+        self._draftslice_draft_step: Any | None = None
 
         if os.environ.get("DRAFTSLICE_VLLM_DEBUG") == "1":
             import sys
@@ -394,6 +401,7 @@ class DraftSliceSpeculatorMixin:
         self._draftslice_spec_step = 0
         self._draftslice_call_index = 0
         self._draftslice_req_by_state = {}
+        self._draftslice_draft_step = None
         if self._draftslice_shadow is not None:
             self._draftslice_shadow.clear()
         return super().reset_state()
@@ -530,6 +538,7 @@ class DraftSliceSpeculatorMixin:
                 num_steps=num_steps,
             )
         self._draftslice_idx_mapping = idx_mapping
+        self._draftslice_draft_step = draft_step
         # MTP/EAGLE in this engine calls sample_draft without spec_step_idx for
         # every draft position, so the per-propose call index is the position.
         self._draftslice_step = self._draftslice_call_index
@@ -554,6 +563,7 @@ class DraftSliceSpeculatorMixin:
         if (
             self._draftslice_shadow is not None
             and not self._draftslice_dummy
+            and not self._draftslice_block
             and self._draftslice_step + 1
             < int(getattr(self, "num_speculative_steps", num_steps))
             and self._draftslice_idx_mapping_np is not None
@@ -579,7 +589,51 @@ class DraftSliceSpeculatorMixin:
             req_id, position=position, max_ids=max_ids
         )
 
+    def _block_valid_sets(self, hidden_states: Any) -> list[Any] | None:
+        """Exact valid sets for DFlash block position 0 only.
+
+        DFlash produces one logits tensor for every block position in a single
+        forward, before any draft token is sampled. A later position's grammar
+        state therefore does not exist yet. Position 0 is exact (the worker
+        shadow is already advanced by the verified prefix); positions > 0 get
+        ``None`` so they use the full head. This is deliberately *not* "use the
+        position-0 set for the whole block", which would drop later-position
+        valid tokens.
+
+        Returns ``None`` when no row can be planned, so the caller takes the
+        ordinary full-head fallback.
+        """
+
+        rows = int(hidden_states.shape[0])
+        shadow = self._draftslice_shadow
+        mapping = self._draftslice_idx_mapping
+        steps = self._draftslice_draft_step
+        if shadow is None or mapping is None or steps is None:
+            return None
+        try:
+            states = mapping[:rows].reshape(-1).tolist()
+            positions = steps[:rows].reshape(-1).tolist()
+        except Exception as exc:  # pragma: no cover - defensive
+            self._draftslice_stats.record_error(f"block mapping: {exc}")
+            return None
+        if len(states) != rows or len(positions) != rows:
+            return None
+        result: list[Any] = []
+        planned = 0
+        for state, position in zip(states, positions, strict=True):
+            if int(position) == 0 and shadow.has(int(state)):
+                result.append(shadow.valid_ids(int(state), step=0))
+                planned += 1
+            else:
+                result.append(None)
+        if not planned:
+            return None
+        self._draftslice_stats.block_step0_rows += planned
+        return result
+
     def _valid_sets_for_rows(self, hidden_states: Any) -> list[Any] | None:
+        if self._draftslice_block:
+            return self._block_valid_sets(hidden_states)
         rows = int(hidden_states.shape[0])
         shadow = self._draftslice_shadow
         try:
@@ -730,8 +784,17 @@ class DraftSliceSpeculatorMixin:
         t0 = time.perf_counter()
         try:
             candidates = screener.candidates(hidden_states)
+            universe = config.universe
+            if (
+                self._draftslice_block
+                and self._draftslice_shadow is not None
+                and self._draftslice_shadow.entries
+            ):
+                # Structured DFlash: rows after block position 0 have no exact
+                # state, so never let free-form candidates bypass the grammar.
+                universe = "valid"
             result = _screen_valid_sets(
-                valid_sets, candidates, universe=config.universe
+                valid_sets, candidates, universe=universe
             )
         except Exception as exc:
             self._draftslice_stats.screener_errors += 1
@@ -774,7 +837,7 @@ class DraftSliceSpeculatorMixin:
     def _logits_postprocess(self) -> tuple[float, float | None, bool]:
         processor = getattr(getattr(self, "model", None), "logits_processor", None)
         if processor is None:
-            return 1.0, None, False
+            return 1.0, None, True
         if getattr(processor, "logits_as_input", False):
             return 1.0, None, False
         scale = float(getattr(processor, "scale", 1.0))
@@ -897,10 +960,11 @@ def _build_speculators() -> tuple[type, type, type, type, type, type]:
         pass
 
     class DraftSliceDFlashSpeculator(DraftSliceSpeculatorMixin, DFlashSpeculator):
-        # DFlash uses one forward pass for the whole block; a single captured
-        # bitmask is not a per-position grammar state. Keep it a safe pass-through
-        # until the block-position plan contract is implemented.
-        _draftslice_allow_slicing = False
+        # DFlash uses one forward pass for the whole block. Only block position
+        # 0 has an exact grammar state before sampling; later positions use the
+        # full head so no valid token is dropped.
+        _draftslice_allow_slicing = True
+        _draftslice_block = True
 
     class DraftSliceMTPConfig(MTPSpeculatorConfig):
         speculator_class = "draftslice.integrations.vllm.DraftSliceMTPSpeculator"

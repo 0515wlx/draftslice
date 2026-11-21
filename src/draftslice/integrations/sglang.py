@@ -1,27 +1,50 @@
-"""SGLang integration boundary.
+"""SGLang integration: grammar-aware draft-head slicing.
 
-SGLang's EAGLE worker captures draft logits in
-``EagleWorker.capture_for_decode`` and then keeps the top-k probabilities. The
-DraftSlice boundary is deliberately smaller than the vLLM adapter: it provides
-the candidate-set transform and a guarded registration entry point.
+SGLang's EAGLE draft loop knows the per-request grammar state before the first
+draft token of each proposal, and it already applies a grammar mask to the
+target verify logits. DraftSlice adds the missing piece: on draft block
+position 0 it slices the draft LM head to the grammar-valid rows instead of
+computing the full vocabulary. Later positions keep the full head because their
+grammar state depends on draft tokens that are not sampled yet.
 
-Runtime status: the boundary and imports are validated against SGLang 0.5.23
-(``eagle_worker_v2``). The engine hook still needs a per-request grammar-state
-provider: it must run the draft LM head on a ``HeadPlan`` row set (not mask
-logits after the full head), and keep the full head when no state exists.
-``register()`` only claims availability after the speculative worker imports.
+The hook is opt-in (``DRAFTSLICE_SGLANG=1``) and installed as an SGLang general
+plugin. It patches two narrow points:
+
+- ``EagleDraftWorker.draft`` publishes the batch grammars and a step counter in a
+  context variable;
+- ``LogitsProcessor._compute_lm_head`` consumes that state on step 0 and calls
+  the shared DraftSlice row kernel. Unsupported heads (TP > 1, quantized, no
+  CUDA weight, no grammar, oversized valid set, or any error) fall back to the
+  original full head.
+
+The target verifier remains exact. No later-position valid token is dropped
+because those positions never use the position-0 candidate set.
 """
 
 from __future__ import annotations
 
+import json
 import os
-from dataclasses import dataclass
+from contextvars import ContextVar
+from dataclasses import dataclass, replace
 from typing import Any
 
+from ..constraints.xgrammar import bitmask_to_token_set
 from ..plan.types import TokenSet
 from ..screen.base import Screener
+from .vllm_logits import build_draft_logits
 
 _REGISTERED = False
+_PATCHED = False
+_DRAFT_STATE: ContextVar[dict[str, Any] | None] = ContextVar(
+    "draftslice_sglang_draft_state", default=None
+)
+_ORIGINAL_DRAFT: Any | None = None
+_ORIGINAL_LM_HEAD: Any | None = None
+_ORIGINAL_DRAFTS: dict[type, Any] = {}
+_SCREENER: Screener | None = None
+_SCREENER_READY = False
+_STATS = {"step0_calls": 0, "sliced_calls": 0, "candidate_rows": 0, "fallback_calls": 0}
 
 
 class SglangIntegrationError(RuntimeError):
@@ -30,26 +53,331 @@ class SglangIntegrationError(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class SglangConfig:
-    """Environment-level switches for the boundary."""
+    """Environment-level switches for the SGLang hook."""
 
-    enabled: bool = True
+    enabled: bool = False
     screener: str | None = None
-    universe: str = "valid"
+    screener_args: dict[str, Any] | None = None
+    screener_artifact: str | None = None
+    max_rows: int = 32_768
+
+    def __post_init__(self) -> None:
+        if self.max_rows <= 0:
+            raise SglangIntegrationError("max_rows must be positive")
+
+
+def _flag(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default) not in ("0", "false", "False", "")
+
+
+def _json_args(name: str) -> dict[str, Any] | None:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise SglangIntegrationError(f"{name} is not valid JSON: {exc}") from exc
+    if not isinstance(value, dict):
+        raise SglangIntegrationError(f"{name} must be a JSON object")
+    return value
 
 
 def config_from_env() -> SglangConfig:
-    def flag(name: str, default: str = "1") -> bool:
-        return os.environ.get(name, default) not in ("0", "false", "False")
-
-    universe = os.environ.get("DRAFTSLICE_SGLANG_UNIVERSE", "valid").strip().lower()
-    if universe not in ("valid", "vocab"):
-        raise SglangIntegrationError("DRAFTSLICE_SGLANG_UNIVERSE must be valid or vocab")
-    screener = os.environ.get("DRAFTSLICE_SGLANG_SCREENER", "").strip() or None
+    raw_rows = os.environ.get("DRAFTSLICE_SGLANG_MAX_ROWS", "32768").strip()
+    try:
+        max_rows = int(raw_rows)
+    except ValueError as exc:
+        raise SglangIntegrationError(
+            "DRAFTSLICE_SGLANG_MAX_ROWS must be an integer"
+        ) from exc
     return SglangConfig(
-        enabled=flag("DRAFTSLICE_SGLANG"),
-        screener=screener,
-        universe=universe,
+        enabled=_flag("DRAFTSLICE_SGLANG"),
+        screener=os.environ.get("DRAFTSLICE_SGLANG_SCREENER", "").strip() or None,
+        screener_args=_json_args("DRAFTSLICE_SGLANG_SCREENER_ARGS"),
+        screener_artifact=os.environ.get(
+            "DRAFTSLICE_SGLANG_SCREENER_ARTIFACT", ""
+        ).strip()
+        or None,
+        max_rows=max_rows,
     )
+
+
+def _ensure_screener(config: SglangConfig) -> Screener | None:
+    """Load the optional screener once per process."""
+
+    global _SCREENER, _SCREENER_READY
+    if _SCREENER_READY:
+        return _SCREENER
+    _SCREENER_READY = True
+    try:
+        if config.screener_artifact:
+            from ..screen import load_screener_bundle
+
+            _SCREENER, _ = load_screener_bundle(config.screener_artifact)
+        elif config.screener:
+            from ..screen import get_screener
+
+            _SCREENER = get_screener(
+                config.screener, **(config.screener_args or {})
+            )
+    except Exception:
+        _SCREENER = None
+    return _SCREENER
+
+
+def _move_screener(screener: Screener, device: Any) -> Screener:
+    updates: dict[str, Any] = {}
+    for name in ("centroids", "w1", "w2", "vr", "a", "group_mass"):
+        value = getattr(screener, name, None)
+        if value is not None and hasattr(value, "to"):
+            if getattr(value, "device", None) != device:
+                updates[name] = value.to(device)
+    return replace(screener, **updates) if updates else screener
+
+
+def _grammar_candidates(
+    state: dict[str, Any],
+    rows: int,
+    vocab_size: int,
+    *,
+    max_rows: int,
+    device: Any,
+    screener: Screener | None,
+    step: int = 0,
+) -> list[TokenSet | None] | None:
+    """Return one candidate set per draft row for block position 0."""
+
+    if step != 0:
+        return None
+    grammars = state.get("grammars")
+    if not grammars:
+        return None
+    batch = len(grammars)
+    if batch <= 0 or rows % batch != 0:
+        return None
+    repeat = rows // batch
+    try:
+        mask = grammars[0].allocate_vocab_mask(vocab_size, batch, "cpu")
+        for index, grammar in enumerate(grammars):
+            if grammar is None or grammar.is_terminated():
+                continue
+            grammar.fill_vocab_mask(mask, index)
+    except Exception:
+        return None
+
+    per_request: list[TokenSet | None] = []
+    for index, grammar in enumerate(grammars):
+        if grammar is None or grammar.is_terminated():
+            per_request.append(None)
+            continue
+        try:
+            tokens = bitmask_to_token_set(mask[index], vocab_size)
+        except Exception:
+            per_request.append(None)
+            continue
+        if tokens.is_empty or len(tokens) > max_rows:
+            per_request.append(None)
+            continue
+        per_request.append(tokens)
+
+    if not any(tokens is not None for tokens in per_request):
+        return None
+
+    if screener is not None:
+        screener = _move_screener(screener, device)
+        try:
+            proposed = screener.candidates(state["hidden_states"])
+        except Exception:
+            return None
+        if len(proposed) != batch:
+            return None
+        per_request = [
+            None if valid is None else valid.intersection(candidate)
+            for candidate, valid in zip(proposed, per_request, strict=True)
+        ]
+        per_request = [
+            None if tokens is None or tokens.is_empty else tokens
+            for tokens in per_request
+        ]
+
+    return [
+        per_request[index // repeat] if repeat else None for index in range(rows)
+    ]
+
+
+def _sliceable_weight(lm_head: Any) -> Any | None:
+    weight = getattr(lm_head, "weight", None)
+    if weight is None or getattr(weight, "device", None) is None:
+        return None
+    if weight.device.type != "cuda":
+        return None
+    if getattr(lm_head, "tp_size", 1) != 1:
+        return None
+    if getattr(lm_head, "quant_method", None) is not None:
+        return None
+    return weight
+
+
+def _patched_compute_lm_head(
+    self: Any,
+    hidden_states: Any,
+    lm_head: Any,
+    embedding_bias: Any = None,
+    *,
+    out: Any = None,
+) -> Any:
+    state = _DRAFT_STATE.get()
+    if state is None or _ORIGINAL_LM_HEAD is None:
+        return _ORIGINAL_LM_HEAD(
+            self, hidden_states, lm_head, embedding_bias, out=out
+        )
+
+    step = int(state.get("step", 0))
+    if step != 0:
+        state["step"] = step + 1
+        return _ORIGINAL_LM_HEAD(
+            self, hidden_states, lm_head, embedding_bias, out=out
+        )
+
+    config: SglangConfig = state["config"]
+    state["step"] = step + 1
+    _STATS["step0_calls"] += 1
+    weight = _sliceable_weight(lm_head)
+    if weight is None:
+        _STATS["fallback_calls"] += 1
+        return _ORIGINAL_LM_HEAD(
+            self, hidden_states, lm_head, embedding_bias, out=out
+        )
+    rows = int(hidden_states.shape[0])
+    vocab_size = min(int(getattr(self, "vocab_size", weight.shape[0])), weight.shape[0])
+    state["hidden_states"] = hidden_states
+    candidates = _grammar_candidates(
+        state,
+        rows,
+        vocab_size,
+        max_rows=config.max_rows,
+        device=hidden_states.device,
+        screener=_ensure_screener(config),
+        step=step,
+    )
+    if candidates is None:
+        _STATS["fallback_calls"] += 1
+        return _ORIGINAL_LM_HEAD(
+            self, hidden_states, lm_head, embedding_bias, out=out
+        )
+
+    def full_logits(subset: Any) -> Any:
+        return _ORIGINAL_LM_HEAD(self, subset, lm_head, embedding_bias, out=None)
+
+    try:
+        logits, _ = build_draft_logits(
+            hidden_states,
+            weight[:vocab_size],
+            candidates,
+            vocab_size=vocab_size,
+            full_logits=full_logits,
+            max_slice_rows=config.max_rows,
+        )
+    except Exception:
+        _STATS["fallback_calls"] += 1
+        return _ORIGINAL_LM_HEAD(
+            self, hidden_states, lm_head, embedding_bias, out=out
+        )
+    state["sliced_calls"] = int(state.get("sliced_calls", 0)) + 1
+    _STATS["sliced_calls"] += 1
+    _STATS["candidate_rows"] += sum(
+        0 if tokens is None else len(tokens) for tokens in candidates
+    )
+    if os.environ.get("DRAFTSLICE_SGLANG_DEBUG") == "1":
+        import sys
+
+        print(
+            f"[draftslice:sglang] step0 sliced rows={rows} "
+            f"candidates={_STATS['candidate_rows']} stats={_STATS}",
+            file=sys.stderr,
+            flush=True,
+        )
+    return logits
+
+
+def _patched_draft(self: Any, batch: Any, *args: Any, **kwargs: Any) -> Any:
+    original = None
+    for cls in type(self).__mro__:
+        if cls in _ORIGINAL_DRAFTS:
+            original = _ORIGINAL_DRAFTS[cls]
+            break
+    if original is None:
+        raise SglangIntegrationError("SGLang draft hook is not installed")
+    config = config_from_env()
+    grammars = (
+        getattr(getattr(batch, "sampling_info", None), "grammars", None)
+        if config.enabled and getattr(batch, "has_grammar", False)
+        else None
+    )
+    state = (
+        {
+            "grammars": grammars,
+            "step": 0,
+            "config": config,
+            "topk": int(getattr(self, "topk", 1)),
+            "sliced_calls": 0,
+        }
+        if grammars
+        else None
+    )
+    token = _DRAFT_STATE.set(state)
+    try:
+        return original(self, batch, *args, **kwargs)
+    finally:
+        _DRAFT_STATE.reset(token)
+
+
+def install() -> None:
+    """Install the SGLang draft/head hooks (idempotent)."""
+
+    global _PATCHED, _ORIGINAL_DRAFT, _ORIGINAL_LM_HEAD
+    if _PATCHED:
+        return
+    try:
+        from sglang.srt.layers.logits_processor import LogitsProcessor
+        from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
+        from sglang.srt.speculative.frozen_kv_mtp_worker_v2 import (
+            FrozenKVMTPDraftWorker,
+        )
+    except Exception as exc:  # pragma: no cover - engine optional
+        raise SglangIntegrationError(
+            f"cannot install the SGLang hook: {exc}"
+        ) from exc
+    for cls in (EagleDraftWorker, FrozenKVMTPDraftWorker):
+        if cls.draft is not _patched_draft:
+            _ORIGINAL_DRAFTS[cls] = cls.draft
+            cls.draft = _patched_draft
+    _ORIGINAL_DRAFT = _ORIGINAL_DRAFTS.get(EagleDraftWorker)
+    _ORIGINAL_LM_HEAD = LogitsProcessor._compute_lm_head
+    LogitsProcessor._compute_lm_head = _patched_compute_lm_head
+    _PATCHED = True
+
+
+def _sglang_status() -> tuple[bool, str]:
+    try:
+        import sglang  # noqa: F401
+    except ImportError as exc:
+        return False, f"sglang is not installed: {exc}"
+    try:
+        import sglang.srt.speculative.spec_info  # noqa: F401
+    except Exception as exc:
+        return False, f"sglang speculative interfaces are unavailable: {exc}"
+    for module in (
+        "sglang.srt.speculative.eagle_worker_v2",
+        "sglang.srt.speculative.eagle_worker",
+    ):
+        try:
+            __import__(module)
+            return True, ""
+        except Exception:
+            continue
+    return False, "sglang has no importable EAGLE draft worker"
 
 
 def screen_logits(
@@ -62,10 +390,8 @@ def screen_logits(
 ) -> Any:
     """Mask logits to ``A ∩ V`` (or ``A`` for free-form rows).
 
-    ``logits`` and ``hidden_states`` have the same batch rows. Rows without a
-    plan (free-form with ``universe="valid"``, empty intersections, or screener
-    errors handled by the caller) are returned unchanged. The input tensor is
-    not mutated; a new tensor is returned.
+    This pure helper remains available for hosts that prefer a post-head mask.
+    The plugin path above slices the head instead.
     """
 
     if universe not in ("valid", "vocab"):
@@ -110,35 +436,8 @@ def screen_logits(
     return out
 
 
-def _sglang_status() -> tuple[bool, str]:
-    try:
-        import sglang  # noqa: F401
-    except ImportError as exc:
-        return False, f"sglang is not installed: {exc}"
-    try:
-        import sglang.srt.speculative.spec_info  # noqa: F401
-    except Exception as exc:
-        return False, f"sglang speculative interfaces are unavailable: {exc}"
-    for module in (
-        "sglang.srt.speculative.eagle_worker_v2",
-        "sglang.srt.speculative.eagle_worker",
-    ):
-        try:
-            __import__(module)
-            return True, ""
-        except Exception:
-            continue
-    return False, "sglang has no importable EAGLE draft worker"
-
-
 def register() -> None:
-    """Register the SGLang boundary.
-
-    There is no stable public registration API across SGLang releases, so this
-    function only checks the engine surface. The host integration must wrap the
-    draft head with :func:`screen_logits` (or a plan-aware equivalent) and keep
-    the full head when per-request grammar state is absent.
-    """
+    """SGLang general-plugin entry point."""
 
     global _REGISTERED
     if _REGISTERED:
@@ -147,9 +446,10 @@ def register() -> None:
     if not available:
         raise SglangIntegrationError(
             f"DraftSlice SGLang boundary is unavailable: {reason}. "
-            "Install a complete SGLang build with an importable EAGLE worker "
-            "before enabling the engine hook."
+            "Install a complete SGLang build with an importable EAGLE worker."
         )
+    if config_from_env().enabled:
+        install()
     _REGISTERED = True
 
 
@@ -157,6 +457,7 @@ __all__ = [
     "SglangConfig",
     "SglangIntegrationError",
     "config_from_env",
+    "install",
     "register",
     "screen_logits",
 ]
