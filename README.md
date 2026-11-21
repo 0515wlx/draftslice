@@ -32,10 +32,10 @@ includes hashed release manifests, Markdown reports, B5 comparison, and an
 SGLang boundary (engine validation is blocked by a missing `sgl_kernel` in the
 reference install). The public DFlash draft
 `z-lab/Qwen3.5-4B-DFlash` is verified with vLLM's built-in `dflash` path;
-DraftSlice's DFlash adapter is future work. The calibrated screener training,
-full release benchmark, and SGLang engine hook are still in progress. Research code,
-experimental data, and benchmark results are intentionally not part of this
-repository.
+DraftSlice's DFlash adapter is future work. The remaining release work is a
+multi-seed result run on the prescribed datasets and validation of the SGLang
+engine hook. Research code, experimental data, and benchmark results are
+intentionally not part of this repository.
 
 ## Scope
 

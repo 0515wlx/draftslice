@@ -1,3 +1,3 @@
-"""Serving-engine integrations (planned)."""
+"""Serving-engine integrations."""
 
 __all__: list[str] = []
