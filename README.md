@@ -15,9 +15,21 @@ across requests and steps, and exposes its cost to the draft scheduler.
 
 ## Status
 
-**Pre-alpha.** This repository currently contains the project skeleton and
-stable interfaces only. Research code, experimental data, benchmark results,
-and work-in-progress designs are intentionally not part of this repository.
+**Pre-alpha.** The public package contains the plan core (strict and calibrated
+compilation, serialization, compiler-level plan cache, reference executor), the
+runtime pieces (cost model, vocabulary layout, candidate-set and packed-row
+caches, union/tree executor, acceptance-aware scheduler), a unified screener
+registry and screened plan compilation (strict, constrained-calibrated, and
+free-form calibrated), fixed-clock Torch/Triton kernels with shape dispatch,
+CUDA-graph replay and opt-in autotuning, an xgrammar constraint adapter with B3
+replay, a vLLM plugin with a strict constrained draft path and a per-position
+grammar shadow, a B4 end-to-end runner, and a fair offline baseline suite
+including CFHead/FlashHead/VocabTrim-style reference policies. The public DFlash draft
+`z-lab/Qwen3.5-4B-DFlash` is verified with vLLM's built-in `dflash` path;
+DraftSlice's DFlash adapter is future work. The calibrated screener training,
+SGLang adapter, and full release benchmark are still in progress. Research code,
+experimental data, and benchmark results are intentionally not part of this
+repository.
 
 ## Scope
 
@@ -65,33 +77,92 @@ grammar / schema
  draft tree ------> target verifier (exact)
 ```
 
-See [docs/design.md](docs/design.md) for the public design notes.
+See [docs/design.md](docs/design.md) for the public design notes. The target
+component boundaries, plan formats, and milestone definitions are in
+[docs/architecture.md](docs/architecture.md). The benchmark tiers, metrics, and
+measurement protocols are in [docs/benchmark.md](docs/benchmark.md). The gap
+analysis and competitive plan are in
+[docs/competitive-plan.md](docs/competitive-plan.md).
 
 ## Install
 
 ```bash
 python -m pip install -e ".[dev]"
+
+# GPU kernels and performance tests
+python -m pip install -e ".[dev,kernels]"
+
+# vLLM plugin
+python -m pip install -e ".[dev,kernels,vllm]"
 ```
 
 ## CLI
 
 ```bash
 draftslice --help
-draftslice compile --schema tool.json --out plan.json
+draftslice compile --valid-ids 1,3,5 --vocab-size 8 --out plan.json
+draftslice compile --schema tests/fixtures/token_set.json --out plan.json
+draftslice bench accuracy --input records.jsonl --out result.json
+draftslice bench kernel --gpu 0 --batch 1,8,32,64 \
+  --rows 128,1024,4096,8192,16384 --out kernel.json
+draftslice bench constraint --schema schema.json --tokenizer /path/to/model \
+  --max-steps 64 --out b3.json
+draftslice bench e2e --model /path/to/model --method draftslice_mtp \
+  --batch 1,8 --out b4.json
 draftslice bench --config configs/example.toml
 draftslice serve --config configs/example.toml
 ```
 
-The CLI is a pre-alpha skeleton; commands currently validate arguments and
-fail with a clear "not implemented" message.
+The CLI is pre-alpha. `compile` writes a real plan from the reference constraint
+fixture backend, `bench accuracy` evaluates cached candidate records, and
+`bench kernel` measures full/gather/fused kernels with the SM clock locked. The
+config-driven benchmark runner and `serve` are still placeholders.
+
+## vLLM plugin
+
+Installing the package registers a `vllm.general_plugins` entry point. The plugin
+adds `draftslice_mtp`, `draftslice_eagle3`, and a safe pass-through
+`draftslice_dflash` speculative method:
+
+```bash
+vllm serve Qwen/Qwen3.5-4B \
+  --speculative-config '{"method":"draftslice_mtp","num_speculative_tokens":1}'
+```
+
+The first cut slices the draft LM head for draft step 0 using the captured
+structured-output bitmask. **Slicing is opt-in** (`DRAFTSLICE_VLLM_SLICE=1`)
+because the captured bitmask is one grammar state ahead of the draft token: on a
+changing grammar it can drop valid draft tokens and lower acceptance. The safe
+default is to fall back to the full head. The target verifier remains exact. See
+[docs/architecture.md §16](docs/architecture.md#16-vllm-integration-first-cut)
+for the hook points and limitations.
+
+DFlash is supported through vLLM's built-in `dflash` path with the public draft
+`z-lab/Qwen3.5-4B-DFlash`. DraftSlice registers `draftslice_dflash` as a safe
+pass-through: parallel block drafting needs per-position grammar state, so
+block-position slicing is not enabled. See
+[docs/architecture.md §18.5](docs/architecture.md#185-dflash).
 
 ## Roadmap
 
 - **M0** project skeleton, interfaces, CI (this repository)
-- **M1** grammar-state plan compiler and plan format
-- **M2** slice cache and draft-head kernels
-- **M3** vLLM and SGLang integrations
-- **M4** evaluation on EAGLE / DFlash / MTP with structured workloads
+- **M1** plan core: strict compiler, plan format, reference executor, and
+  conformance suite
+- **M2** runtime, slice cache, cost model, and scheduler
+- **M3** optimized slice kernels: shape dispatch, row-block GEMV, tensor-core
+  GEMM, baseline kernel parity, and CUDA-graph replay (done); union/tree
+  execution and runtime autotuning next
+- **M4** vLLM integration: plugin and strict draft-step-0 path (done); TP/quantized
+  hardening and end-to-end structured workloads next
+- **M5** fair baseline suite (implemented, including CFHead/FlashHead reference
+  policies), artifact/partition/conformal core, calibrated plan compilation, and
+  the acceptance model (implemented); router training and calibrated end-to-end
+  runs next
+- **M6** DFlash adapter, SGLang integration, and release benchmark
+
+Each milestone has a definition of done in
+[docs/architecture.md](docs/architecture.md); the benchmark gates are in
+[docs/benchmark.md](docs/benchmark.md).
 
 ## Related work
 

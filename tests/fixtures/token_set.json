@@ -1,0 +1,6 @@
+{
+  "state_id": 2,
+  "vocab_size": 8,
+  "hidden_size": 4,
+  "valid_ids": [5, 1, 3]
+}

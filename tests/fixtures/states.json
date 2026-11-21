@@ -1,0 +1,8 @@
+{
+  "vocab_size": 8,
+  "hidden_size": 4,
+  "states": [
+    {"state_id": 0, "valid_ids": [1, 2]},
+    {"state_id": 1, "valid_ids": [2, 3, 7]}
+  ]
+}

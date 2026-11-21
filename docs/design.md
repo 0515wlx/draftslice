@@ -1,7 +1,9 @@
 # DraftSlice design notes
 
 Status: public, pre-alpha. This document describes the intended system. It
-does not report benchmark results.
+does not report benchmark results. The implementation plan is in
+[architecture.md](architecture.md); the evaluation plan is in
+[benchmark.md](benchmark.md).
 
 ## 1. Problem
 
@@ -65,7 +67,9 @@ grammar / schema
 
 In scope:
 
-- exact constrained row selection for the draft head;
+- exact constrained row selection for the draft head (strict mode);
+- optional calibrated candidate screening followed by exact rescoring, with the
+  coverage target stated explicitly;
 - caching plans and rows across requests/steps;
 - draft-aware scheduling;
 - composition with low-rank, subset, and sparse draft heads for free-form
@@ -75,14 +79,19 @@ Out of scope:
 
 - target-head approximation;
 - lossy speculative verification;
-- replacing general draft-head compression.
+- replacing general draft-head compression;
+- claiming exact valid-set coverage in calibrated mode. Calibrated mode reports
+  its delta and empirical coverage; strict mode is the only mode that guarantees
+  every valid token is present.
 
 ## 5. Correctness and distribution semantics
 
 The target verifier accepts only tokens on a verified target path. DraftSlice
-does not change that contract. For constrained decoding, the system guarantees
-**validity** (only grammar-valid tokens are proposed) and preserves the exact
-valid-token set used by the target. It does not claim to sample the
+does not change that contract. In strict mode, the system guarantees **validity**
+(only grammar-valid tokens are proposed) and preserves the exact valid-token set
+used by the target. In calibrated mode it still proposes only valid tokens, but
+the candidate set may omit valid tokens; the plan must report its coverage target
+and empirical coverage. In both cases DraftSlice does not claim to sample the
 grammar-conditional distribution `mu*`; local masking samples a projected
 distribution. Papers and integrations must state which distribution is
 intended.

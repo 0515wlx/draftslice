@@ -17,4 +17,18 @@ class PlanCache(Protocol):
     def clear(self) -> None: ...
 
 
-__all__ = ["PlanCache"]
+from .candidate_cache import CandidateSetCache  # noqa: E402
+from .plan_cache import CacheStats, LRUPlanCache, plan_bytes  # noqa: E402
+from .row_cache import PackedRowCache, PackedRows, pack_weight_rows, rowset_key  # noqa: E402
+
+__all__ = [
+    "CacheStats",
+    "CandidateSetCache",
+    "LRUPlanCache",
+    "PackedRowCache",
+    "PackedRows",
+    "PlanCache",
+    "pack_weight_rows",
+    "plan_bytes",
+    "rowset_key",
+]

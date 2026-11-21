@@ -32,6 +32,10 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
+runtime = ["torch>=2.2"]
+kernels = ["torch>=2.2", "triton>=3.0"]
+bench = ["torch>=2.2", "triton>=3.0", "numpy>=1.24"]
+vllm = ["vllm>=0.34"]
 dev = [
   "pytest>=8",
   "ruff>=0.6",
@@ -39,6 +43,9 @@ dev = [
 
 [project.scripts]
 draftslice = "draftslice.cli:main"
+
+[project.entry-points."vllm.general_plugins"]
+draftslice = "draftslice.integrations.vllm:register"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -54,3 +61,6 @@ select = ["E", "F", "I", "UP", "B"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+markers = [
+  "perf: GPU performance tests; set DRAFTSLICE_RUN_PERF=1 and lock clocks",
+]

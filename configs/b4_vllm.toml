@@ -1,0 +1,38 @@
+# B4 end-to-end configuration (vLLM, single GPU).
+#
+# Run one method per process to avoid GPU-memory fragmentation:
+#   draftslice bench e2e --model "$DRAFTSLICE_MODEL_ROOT/Qwen3.5-4B" \
+#     --method mtp --out runs/b4_mtp.json
+#   draftslice bench e2e --model "$DRAFTSLICE_MODEL_ROOT/Qwen3.5-4B" \
+#     --method draftslice_mtp --out runs/b4_draftslice_mtp.json
+#
+# Then compare with `draftslice bench compare` (or the comparison block emitted by
+# `--methods mtp,draftslice_mtp`).
+
+[model]
+name = "Qwen3.5-4B"
+dtype = "bfloat16"
+max_model_len = 2048
+
+[engine]
+name = "vllm"
+gpu_memory_utilization = 0.55
+enforce_eager = false
+
+[speculation]
+methods = ["mtp", "draftslice_mtp"]
+spec_tokens = 1
+draft_model = ""
+
+[workloads]
+cases = ["json_person", "tool_call", "json_array", "regex_date", "math", "chat"]
+batch = [1, 8]
+max_tokens = 64
+temperature = 0.0
+repetitions = 1
+
+[report]
+validity = true
+tau = true
+throughput = true
+greedy_equality = true
