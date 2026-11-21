@@ -216,6 +216,10 @@ def _sliceable_weight(lm_head: Any) -> Any | None:
         return None
     if getattr(lm_head, "quant_method", None) is not None:
         return None
+    num_embeddings = getattr(lm_head, "num_embeddings", None)
+    if num_embeddings is not None and int(num_embeddings) != int(weight.shape[0]):
+        # A sharded/padded head must not be sliced as if it were the full vocab.
+        return None
     return weight
 
 
