@@ -13,6 +13,12 @@ across requests and steps, and exposes its cost to the draft scheduler.
 
 > Don't score what you can't propose.
 
+The system is evaluated at the **server** level (throughput, TTFT/ITL, validity,
+and cost), not by acceptance length alone. `tau` is a tunable acceptance metric:
+when reducing draft or verification work lowers server latency, DraftSlice may
+deliberately trade some `tau` for a better operating point. The target verifier
+remains exact.
+
 ## Status
 
 **Pre-alpha.** The public package contains the plan core (strict and calibrated
@@ -34,10 +40,24 @@ Qwen3.5 built-in MTP). The vLLM DFlash
 adapter slices block position 0 exactly and has a real Qwen3.5-4B run. The
 public DFlash draft
 `z-lab/Qwen3.5-4B-DFlash` is verified with vLLM's built-in `dflash` path;
-per-position slicing after block position 0 is future work. The remaining
-release work is a multi-seed result run on the prescribed datasets and real
-SGLang EAGLE validation. Research code, experimental data, and benchmark results
-are intentionally not part of this repository.
+`draftslice_dflash` slices block position 0 with the exact worker shadow, while
+later positions stay on the full head. Per-position slicing after block position
+0 is future work. The remaining release work is a multi-seed result run on the
+prescribed datasets and real SGLang EAGLE validation.
+
+The current engine path exercises the strict grammar slice directly (worker
+shadow + candidate rows + fused kernel). The offline plan/compiler, cost model,
+scheduler, union executor, and candidate/row caches are implemented and tested,
+but they are **not yet the production engine path**; wiring them into the engine
+is tracked in [docs/architecture.md](docs/architecture.md). Research code,
+experimental data, and benchmark results are intentionally not part of this
+repository.
+
+> **Production default (2026-11-22):** built-in speculative decoding; DraftSlice
+> is a measured per-cell profile, not a blanket structured path. On Qwen3.5-4B at
+> B=8 the strict slice is a regression (0.767× on a mixed workload), so the
+> default profile table enables no B=8 cells. See
+> [docs/production-architecture.md](docs/production-architecture.md).
 
 ## Scope
 
@@ -129,26 +149,33 @@ config-driven benchmark runner and `serve` are still placeholders.
 ## vLLM plugin
 
 Installing the package registers a `vllm.general_plugins` entry point. The plugin
-adds `draftslice_mtp`, `draftslice_eagle3`, and a safe pass-through
-`draftslice_dflash` speculative method:
+adds `draftslice_mtp`, `draftslice_eagle3`, and `draftslice_dflash` speculative
+methods:
 
 ```bash
 vllm serve Qwen/Qwen3.5-4B \
   --speculative-config '{"method":"draftslice_mtp","num_speculative_tokens":1}'
 ```
 
-The first cut slices the draft LM head for draft step 0 using the captured
-structured-output bitmask. **Slicing is opt-in** (`DRAFTSLICE_VLLM_SLICE=1`)
-because the captured bitmask is one grammar state ahead of the draft token: on a
-changing grammar it can drop valid draft tokens and lower acceptance. The safe
-default is to fall back to the full head. The target verifier remains exact. See
-[docs/architecture.md §16](docs/architecture.md#16-vllm-integration-first-cut)
-for the hook points and limitations.
+The worker-side xgrammar shadow advances with the tokens the target actually
+sampled, so draft step 0 gets the exact next-state valid set rather than the
+one-step-ahead scheduler bitmask. DFlash slices block position 0 the same way;
+later block positions stay on the full head. **Slicing is profile-gated**
+(`DRAFTSLICE_PROFILE_MODE=observe|enforce`): the default is built-in, because
+free-form and some structured workloads regress when slicing is enabled
+globally. Covered engine paths: TP>1 via per-rank vocabulary shards, quantized
+heads via candidate-row dequantization, reasoning parsers via a boundary-gated
+shadow, local-argmax reduction via a sliced `get_draft_top_tokens` override, and
+FULL decode graphs via a pre-replay static packed bitmask. Every decision emits
+a `DraftContract` with the fail-closed reason; inspect `draftslice_stats()` for
+`fallback_reasons`, `last_contract`, and TP shard fields. The target verifier
+remains exact. See
+[docs/architecture.md §16](docs/architecture.md#16-vllm-integration) for the hook
+points and limitations.
 
-DFlash is supported through vLLM's built-in `dflash` path with the public draft
-`z-lab/Qwen3.5-4B-DFlash`. DraftSlice registers `draftslice_dflash` as a safe
-pass-through: parallel block drafting needs per-position grammar state, so
-block-position slicing is not enabled. See
+DFlash support: `draftslice_dflash` slices block position 0 with the exact
+worker shadow. Later block positions stay on the full head because their grammar
+state depends on draft tokens sampled inside the same parallel block. See
 [docs/architecture.md §18.5](docs/architecture.md#185-dflash).
 
 ## Roadmap
@@ -158,10 +185,13 @@ block-position slicing is not enabled. See
   conformance suite
 - **M2** runtime, slice cache, cost model, and scheduler
 - **M3** optimized slice kernels: shape dispatch, row-block GEMV, tensor-core
-  GEMM, baseline kernel parity, and CUDA-graph replay (done); union/tree
-  execution and runtime autotuning next
-- **M4** vLLM integration: plugin and strict draft-step-0 path (done); TP/quantized
-  hardening and end-to-end structured workloads next
+  GEMM, baseline kernel parity, CUDA-graph replay, union/tree execution, and
+  runtime autotuning (done); a tree-specific fused union kernel and engine-owned
+  graph buckets remain
+- **M4** vLLM integration: plugin, strict draft-step-0 path, worker shadow, and
+  structured end-to-end runs (done), per-rank TP>1 shard slicing, a concrete
+  `DraftContract`, quantized heads, reasoning parsers, local-argmax and FULL-graph
+  contracts (done); default routing and server-level tau/latency tuning next
 - **M5** fair baseline suite (implemented, including CFHead/FlashHead reference
   policies), artifact/partition/conformal core, calibrated plan compilation,
   the acceptance model, router training, screener artifacts, and the factorial

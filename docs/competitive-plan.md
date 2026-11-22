@@ -1,8 +1,25 @@
 # DraftSlice competitive plan
 
-Status: internal planning document. It describes what is missing and how to get
-to a defensible advantage over static, low-rank, tile/cluster screening, and
-router-shortlist draft heads. It does not publish benchmark results.
+> **Production status 2026-11-22:** see
+> [`production-architecture.md`](production-architecture.md). The routing
+> experiments show that blanket structured slicing is a regression on
+> Qwen3.5-4B/B8; built-in is the default and DraftSlice is a measured per-cell
+> profile. Failed modes are archived in that file §1.
+
+Status: internal planning document, updated 2026-11-22. It describes the current
+gaps and the path to a defensible server-level advantage over static, low-rank,
+tile/cluster screening, and router-shortlist draft heads. It does not publish
+benchmark results.
+
+2026-11-22 closeout + routing experiments (local report, opt-in code): the
+adapter-level free-form router is implemented and recovers the free-form
+regression; the fused DFlash all-position mask wins at B=1 and is neutral at
+B=8, but only within the DFlash family; a static free-form screener is a
+measured negative. TP>1, quantized heads, and FULL-graph step-0 masking are
+code-complete and unit-tested; real-engine gates remain per cell. The 4B/B8
+routing experiment found that a blanket structured slice is 0.767× on a mixed
+workload, so the production default is built-in and DraftSlice is
+profile-gated. Results are in the local `runs/` workspace.
 
 Related documents:
 
@@ -11,50 +28,56 @@ Related documents:
 
 ## 1. Executive summary
 
-The current repository has a solid **plan core** (strict compilation, cache,
-serialization, reference executor), a **cost/layout/scheduler foundation**, and
-working **torch/Triton kernels** with numerical and fixed-frequency performance
-tests. That is necessary, but not yet sufficient to claim an advantage.
+Status update (2026-11-22): the repository now has the plan core, a unified
+candidate-source registry, an xgrammar backend, union/tree execution, router and
+artifact tooling, vLLM/SGLang adapters, and a B4 runner. The remaining risk is
+not “missing components”; it is **proof that the composed system beats a strong
+fixed baseline at the server level**. The 2026-11-22 closeout adds an adapter
+free-form router and a batch-gated DFlash all-position mask, and records a
+negative static-screener result.
 
 The missing pieces are:
 
-1. a real grammar backend and constraint-state replay;
-2. a screener (router/static/low-rank) and calibrated mode;
-3. union/tree execution for batch and draft trees;
-4. engine-owned CUDA-graph buckets for the target runtime (the kernel-level graph
-   cache exists);
-5. vLLM integration hardening and end-to-end acceptance measurements;
-6. screening-cost-aware latency baselines and a Pareto benchmark at iso-bytes and
-   iso-latency.
+1. engine wiring: the production fast path still bypasses the plan/cost/scheduler/
+   union/cache layer; the profile table is not yet the hot-path decision source;
+2. measured profile cells: 4B B=1 tool, 35B-A3B tool, and DFlash-vs-MTP; a
+   blanket structured slice is a measured negative on 4B/B8;
+3. a positive calibrated/free-form server result at iso-quality, not only an
+   offline candidate-quality table (the first static point is negative);
+4. a server-level tau/latency Pareto: choose `k`, draft depth, source, and budget
+   per workload/batch, and allow a lower `tau` when throughput or tail latency
+   improves;
+5. measured head-share/zero-head bounds instead of parameter-share estimates;
+6. multi-seed, manifest-backed release results on the prescribed datasets.
 
-The strategic opening is **not** "a faster kernel for the same candidate set".
+The strategic opening is **not** “a faster kernel for the same candidate set”.
 It is:
 
-> **Exact when constrained, calibrated when free-form, with one cost-aware plan
-> and union/tree execution.**
+> **Exact when constrained, calibrated when free-form, with one cost-aware
+> execution contract and a server-level operating point.**
 
 Existing methods usually pick one regime: static/low-rank compress the head,
 cluster/tile methods screen the vocabulary, and router methods pick a shortlist.
 DraftSlice can own the **contract** between the grammar state, the candidate set,
-the kernel, and the scheduler, and prove it on structured workloads where the
-valid set changes every step.
+the kernel, the draft depth, and the server objective — and prove it where the
+valid set changes every step or the best `tau` is not the best server point.
 
 ## 2. What is already in place
 
 | Area | Current state | Can we claim advantage? |
 |---|---|---|
-| Plan types and strict coverage | Implemented and tested | Not yet; needs real grammar states |
-| Plan serialization and cache | Implemented | Not yet; cache not wired into compiler |
-| Cost model | A100/H100 profiles, roofline | Not yet; not calibrated against B2 |
-| Layout | native/grouped layout + packing | Not yet; not used by kernels |
-| Torch/Triton kernels | full, naive gather, tuned fused GEMV/GEMM, CUDA graph | Partially: eager wins from ~`m>=1k`; graph replay clears the launch floor |
-| Scheduler | deadline-aware strict/full | Not yet; no acceptance model |
-| Screener / calibrated mode | Not implemented | No |
-| Union/tree executor | Not implemented | No |
-| Grammar backend | Fixture only | No |
-| Engine integration | vLLM draft-step-0 plugin | Partially: strict structured smoke test only |
-| End-to-end benchmark | Not implemented | No |
-| Baselines | full/static/low-rank/group/router/CFHead/FlashHead/VocabTrim policies | Head quality yes; latency matrix incomplete |
+| Plan types and strict coverage | Implemented and tested | Yes for coverage; needs real grammar corpus |
+| Plan serialization and cache | Implemented; compiler-level cache wired | Engine fast path does not use it yet |
+| Cost model | A100/H100 roofline; uncalibrated | No; MAPE and head-share calibration missing |
+| Layout | native/grouped layout + packing | Not used by the engine kernels |
+| Torch/Triton kernels | full, naive gather, tuned fused GEMV/GEMM, CUDA graph, union | Head-only yes; e2e bound depends on head share |
+| Scheduler | deadline-aware strict/full + acceptance model | Implemented offline; not engine-wired |
+| Screener / calibrated mode | registry, partition, conformal, router, artifacts, vLLM hook | Code exists; no positive free-form e2e at iso-quality |
+| Union/tree executor | implemented with per-node scatter | No tree-specific fused kernel / engine use |
+| Grammar backend | xgrammar JSON Schema + regex; shadow | Yes for supported schemas; CFG/corpus missing |
+| Engine integration | vLLM MTP/EAGLE3/DFlash pos0 + allpos mask; SGLang MTP step0 | Code-complete for TP>1/quant/FULL-graph; real-engine gates per profile cell |
+| End-to-end benchmark | B4 runner (vLLM), structured/free-form/DFlash | Exists; no multi-seed server release |
+| Baselines | full/static/low-rank/group/router/CFHead/FlashHead/VocabTrim | Head quality yes; latency/Pareto incomplete |
 
 ## 3. The honest gap analysis
 
@@ -77,42 +100,45 @@ The honest regime split is:
 - medium `m`: eager fused is competitive and graph replay wins clearly;
 - large `m`: fused is bandwidth-bound and beats gather by a wide margin.
 
-The remaining kernel gaps are union/tree execution, runtime autotuning, and
-engine-owned graph buckets, not the eager tiny-M floor.
+The remaining kernel gaps are the tree-specific fused union kernel and
+engine-owned graph buckets. Union/tree execution and runtime autotuning are
+implemented; the eager tiny-M floor is no longer the main issue.
 
-### 3.2 No screener means no free-form advantage
+### 3.2 The screener exists; the free-form advantage is unproven
 
-Strict grammar slicing only helps when a constraint exists and the valid set is
-small enough. Free-form states still use the full head. To compete with
-SpecVocab, CFHead, FlashHead, DynaSpec, and SlimSpec on free-form workloads,
-DraftSlice needs the calibrated path:
+The calibrated path is implemented: vocabulary partition, static/low-rank/group/
+router screeners, candidate-set cache, split-conformal calibration, exact
+rescoring inside the candidate set, and `constrained_calibrated` /
+`freeform_calibrated` modes. Artifact bundles, router training, and the vLLM
+screener hook exist.
 
-- vocabulary partition and leaf layout;
-- router or static/low-rank screener;
-- candidate-set cache;
-- split-conformal calibration;
-- exact rescoring inside the candidate set;
-- `constrained_calibrated` and `freeform_calibrated` modes.
+What is missing is evidence:
 
-Without this, the project is only a grammar-specific optimization and cannot be
-compared on the main free-form Pareto.
+- no positive free-form server result at iso-quality;
+- a static-screen smoke test showed that dropping candidates can destroy `tau`;
+- low-rank/router artifacts have only offline B1/factorial numbers;
+- the engineering path is not wired to the plan/cost/scheduler layer.
 
-### 3.3 No union/tree execution means batch and tree leverage is unrealized
+Without a measured Pareto point, the project cannot claim a free-form advantage.
 
-The current kernels execute one plan at a time. The architecture's main runtime
-advantage is:
+### 3.3 Union/tree executor exists; engine and tree-kernel use do not
+
+Per-node union execution and scatter are implemented (`runtime/union.py`). The
+architecture's runtime lever is:
 
 - deduplicate candidate rows across batch items;
 - deduplicate rows across draft-tree nodes;
 - run one union kernel and scatter to per-request or per-node outputs.
 
-Until this exists, the measured speedups are per-plan and understate the batch
-and tree opportunity. It also means the scheduler cannot trade tree width against
-kernel cost.
+What is missing is a tree-specific fused kernel that writes directly to per-node
+buffers, union-size/crossover benchmarks with real grammar traces, and any engine
+use of the union executor. Until then, measured speedups are per-plan and the
+scheduler cannot trade tree width against kernel cost.
 
-### 3.4 No real grammar backend means no real plan distribution
+### 3.4 Grammar backend exists; real plan distribution is missing
 
-The reference fixture backend is useful for tests, but it cannot answer:
+The xgrammar adapter supports JSON Schema and regex, and B3 trajectory recording
+exists. It still cannot answer at release quality:
 
 - how large valid sets are for JSON Schema, tool calls, regex, SQL, and CFG;
 - how often adjacent steps reuse the same grammar state;
@@ -120,21 +146,28 @@ The reference fixture backend is useful for tests, but it cannot answer:
 - how often strict slicing falls back to full head;
 - how much time plan compilation adds per step.
 
-These are the core empirical questions for the strict product. The next step is
-an xgrammar adapter and a replay format for real trajectories.
+The next step is a real grammar replay corpus and state-hash stability, not a new
+adapter.
 
-### 3.5 No end-to-end measurement means no acceptance claim
+### 3.5 B4 exists; server-level and multi-seed claims are missing
 
-Head-only latency is not the product metric. The target verifier and backbone may
-dominate decode time. We need:
+The B4 vLLM runner now covers structured, free-form, and DFlash cases. It reports
+validity, `tau`, throughput, and greedy equality, and the worker shadow removes
+the old state-timing blocker.
 
-- vLLM integration on the draft path;
-- strict-mode output equality with full-head constrained decoding;
-- acceptance length (`tau`), throughput, TTFT, ITL, and output validity;
-- head-share decomposition so a `8x` head speedup is not reported as an `8x`
-  end-to-end speedup.
+What is still missing:
 
-Without B4, the project cannot claim a speculative-decoding win.
+- server-level TTFT/ITL/cost and head-share decomposition;
+- a tau/latency Pareto that allows a lower `tau` when the server metric improves;
+- TP>1, quantized, and CUDA-graph operating points: code-complete and
+  unit-tested in the working tree; real-engine gates remain per profile cell;
+- a measured profile table: 4B/B8 blanket structured slice is a regression
+  (0.767× mixed workload), so built-in is the default;
+- an SGLang B4 runner;
+- multi-seed, manifest-backed release results.
+
+Head-only latency is not the product metric; a `10×` head speedup can be a `1%`
+or `20%` server speedup depending on the measured head share.
 
 ### 3.6 The cost model is not calibrated
 
@@ -157,11 +190,12 @@ each baseline must be measured with the same kernel effort as the DraftSlice pat
 and reported next to candidate quality. A policy-only table is not a latency
 claim.
 
-### 3.8 Missing artifact/calibration pipeline
+### 3.8 Artifact pipeline exists; calibrated e2e is missing
 
-There is no `ArtifactBundle` builder, no router training, no conformal
-calibration, and no layout builder CLI. The runtime pieces exist, but the
-deployable artifact does not. This blocks every calibrated experiment.
+The `ArtifactBundle` builder, router training, conformal calibration, and layout
+builder exist. The remaining gap is a positive calibrated end-to-end result with
+measured coverage and a server-level Pareto point; the code paths are not the
+blocker.
 
 ## 4. Where the advantage can come from
 
@@ -180,8 +214,9 @@ compression. It is especially valuable for tool calling and structured output,
 where a dropped valid token is a quality bug, not just a slower draft.
 
 **But** it only wins if the valid-set slice is actually cheaper than the full
-head and if plan compilation/caching overhead is small. That is why tiny-M
-latency and state replay are P0.
+head, if plan compilation/caching overhead is small, and if the saved head time is
+a material share of the server step. Tiny-M latency and state replay are now
+implemented; head-share analysis is the remaining gate.
 
 ### 4.2 Accuracy-per-byte advantage: calibrated screen + exact rescoring
 
@@ -217,8 +252,13 @@ This enables per-request and per-tree-node decisions:
 - deadline-aware fallback.
 
 Existing methods often fix `C` or use a static budget. A scheduler that selects
-the Pareto point per step is a real differentiator, provided the acceptance
-model is measured rather than guessed.
+the Pareto point per step is a real differentiator, provided the acceptance model
+is measured rather than guessed.
+
+The objective is the **server metric**, not `tau`: throughput, TTFT/ITL, and cost
+under a quality/SLO constraint. A lower-`tau` plan is valid when it removes draft
+or verification work and improves the server metric. The scheduler must report
+both `tau` and the server result for every trade.
 
 ### 4.4 Cache advantage: grammar state and candidate-set reuse
 
@@ -228,93 +268,80 @@ Two caches matter and are not the same:
 - **selected group set -> candidate rows** for screening.
 
 Structured generation revisits grammar states and leaf sets. A cache hit removes
-plan compilation and row-set construction from the critical path. This is a
-systems advantage that head-compression papers typically do not model.
+plan compilation and row-set construction from the critical path. The current
+engine fast path does not consume these caches yet; wiring them is part of the
+system claim.
 
 ### 4.5 Kernel advantage: union/tree execution and tiny-M specialization
 
 The kernel must win in three regimes:
 
-1. **tiny M** (tens to hundreds of rows): launch-bound; needs a graph/persistent
-   or specialized tiny kernel.
-2. **medium M** (thousands): bandwidth/occupancy-bound; needs better tiling and
+1. **tiny M** (tens to hundreds of rows): launch-bound; graph replay or a
+   persistent/specialized tiny kernel.
+2. **medium M** (thousands): bandwidth/occupancy-bound; better tiling and
    vectorized loads.
 3. **large M / batched tree**: union rows across batch/tree, tensor-core GEMM,
    one gather.
 
-The current kernel wins only in the medium/large per-plan regime. The next
-kernel must reduce the fixed overhead and add union/tree dispatch.
+Eager fused/union kernels and graph replay exist; the remaining gap is a
+tree-specific fused union kernel and engine-owned graph buckets.
 
 ## 5. Prioritized plan
 
-### P0 — Make the strict path real and fast (next)
+### P0 — Make the strict path real and fast (mostly done)
 
-1. **xgrammar adapter**
-   - compile JSON Schema / regex / CFG to state -> valid token set;
-   - record real state transitions;
-   - add a replay format for B3.
-2. **Plan cache integration**
-   - compiler checks `PlanCache` before building a plan;
-   - cache key includes artifact/tokenizer/constraint version;
-   - report hit rate and compile p50/p90.
-3. **Union/tree executor**
-   - deduplicate rows across batch and tree nodes;
-   - one kernel launch, scatter to per-node outputs;
-   - numerical tests against per-plan execution.
-4. **Tiny-M kernel path**
-   - specialized kernel for `m <= 256/1024`;
-   - CUDA graph capture for fixed shape buckets where possible;
-   - target: `<=30 us` for `m<=1k`, `<=60 us` for `m=8k` at fixed A100 clock.
-5. **vLLM strict integration**
-   - draft-path hook, grammar state extraction, strict plan execution;
-   - greedy output equality and 100% validity tests;
-   - measure head share, tau, throughput, TTFT, ITL.
+1. **xgrammar adapter** — implemented for JSON Schema and regex, with B3 replay.
+   Remaining: a real grammar corpus and stable cross-request state hashing.
+2. **Plan cache integration** — compiler-level cache is wired and tested.
+   Remaining: use it in the engine fast path and report hit rate/compile time.
+3. **Union/tree executor** — per-node union execution and numerical tests are
+   implemented. Remaining: a tree-specific fused kernel and engine use.
+4. **Tiny-M kernel path** — fused GEMV/GEMM and CUDA-graph replay are implemented;
+   eager `m<=1k` is ~67 µs, graph replay ~25 µs at fixed A100 clock. Remaining:
+   engine-owned graph buckets.
+5. **vLLM strict integration** — plugin, worker shadow, per-position forks,
+   block-position-0 slice, TP>1 shard, quantized-row dequant, FULL-graph step-0
+   mask, and local-argmax are code-complete and unit-tested; block-position-0
+   slicing has real-engine runs. Remaining: the measured profile table, real-
+   engine gates for each new path, and server-level tau/latency measurement.
 
-**Exit gate:** on UltraChat-200K + ShareGPT and structured tool-call workloads,
-strict mode gives a measurable end-to-end speedup at B>=8 with 100% validity and
-output equality, and the head share is reported.
+**Exit gate:** on structured tool-call workloads, the strict path gives a
+measurable server-level gain at B>=8 with 100% validity and output equality, and
+reports head share plus the best tau/latency point. The current results are
+eager/TP=1 and do not yet satisfy the full production gate.
 
-### P1 — Build the calibrated screener and prove the Pareto
+### P1 — Calibrated screener and Pareto (implemented, evidence missing)
 
-1. **Artifact builder**
-   - leaf/static partition builder;
-   - layout permutation;
-   - `ArtifactBundle` manifest with hashes;
-   - calibration set split by document/session.
-2. **Router/static/low-rank screeners**
-   - start with the leaf router and static prior;
-   - add low-rank as a baseline, not the main path;
-   - train on group marginals, not hard top-1 labels.
-3. **Calibrated modes**
-   - `constrained_calibrated` and `freeform_calibrated`;
-   - split-conformal `C*`;
-   - candidate-set cache;
-   - exact rescoring inside the candidate set.
-4. **Acceptance model and scheduler v2**
-   - map plan coverage to expected accepted length;
-   - choose mode/budget/tree shape under a latency target;
-   - validate on held-out traces.
-5. **B1 baseline matrix**
-   - static, SVD, trained low-rank, CFHead-like, FlashHead-like,
-     DynaSpec-like, CHESS, DraftSlice;
-   - iso-bytes and iso-latency Pareto;
-   - per-domain and on-policy results.
+1. **Artifact builder** — partition, layout, hashed bundles, and document/session
+   split support are implemented.
+2. **Router/static/low-rank screeners** — registry, group-marginal router
+   training, artifacts, and reference CFHead/FlashHead/VocabTrim policies exist.
+3. **Calibrated modes** — `constrained_calibrated` / `freeform_calibrated`,
+   split-conformal `C*`, candidate-set cache, and exact rescoring are implemented.
+4. **Acceptance model and scheduler v2** — acceptance model, `choose_best`, and
+   server-level objective hooks exist; validation on real traces is missing.
+5. **B1 baseline matrix** — offline factorial matrix exists; a real multi-seed
+   dataset run and an e2e latency/Pareto table are missing.
 
 **Exit gate:** at `<=5%` of full-head bytes, DraftSlice matches or beats the best
 baseline on top-1/top-5/OA on the primary mix, with coverage within the reported
-interval.
+interval, **and** a positive server-level free-form point (or an explicit negative
+result).
 
 ### P2 — System-level advantage
 
-1. **Union/tree kernel optimization**
-   - tensor-core union GEMM;
-   - tree scatter;
-   - shape buckets and graph capture;
-   - B=1/8/32/64 sweeps.
-2. **SGLang integration**
-3. **Quantization and multi-model support**
-4. **Nightly B1/B2/B3 and release B4**
-5. **Artifact/result registry and one-command reproduction**
+1. **Union/tree kernel optimization** — union executor and eager kernels exist;
+   tree-specific fused kernel and graph buckets remain.
+2. **SGLang integration** — step-0 MTP hook validated; EAGLE/DFlash/TP>1 and a
+   B4 runner remain.
+3. **Quantization and multi-model support** — both still fall back; this is a
+   production blocker.
+4. **Server-level tau/latency routing** — choose `k`, draft depth, source, and
+   budget per workload/batch; allow lower `tau` when the server metric improves.
+5. **Nightly B1/B2/B3 and release B4** — workflows exist on synthetic data;
+   real multi-seed results remain operator work.
+6. **Artifact/result registry and one-command reproduction** — implemented for
+   implemented schemas; datasets and result files remain external.
 
 ## 6. What to measure to prove an advantage
 
@@ -346,7 +373,9 @@ The claim must be a Pareto statement, not a single point.
 - output validity;
 - task metric;
 - speedup vs full-head and vs no-spec;
-- head share of decode time.
+- head share of decode time;
+- the best server point across the tau/latency sweep, including any deliberate
+  tau reduction and the reason it improved the server metric.
 
 ### Fair comparison rules
 
@@ -368,7 +397,8 @@ These are project gates, not published results.
 | Cost model | MAPE <=25% on held-out shapes | If worse, recalibrate before scheduling claims |
 | Head quality | at <=5% bytes, match/beat best baseline on OA/top-5 | If worse, improve partition/router, not kernel |
 | Calibration | empirical coverage within ±2pp of nominal | If not, fix split/leakage before claiming coverage |
-| End-to-end | >1.2x at B>=8 on structured; no free-form regression | If <1.1x at B>=8, head share/overhead is the bottleneck |
+| End-to-end | server-level win at B>=8 on structured; no free-form server regression; target >1.2x in the best structured configuration | If <1.1x at B>=8, head share/overhead is the bottleneck |
+| Tau tradeoff | a lower-`tau` point is valid only when throughput/TTFT/ITL improves at fixed quality | Lower tau with no server gain is a regression |
 | Reproducibility | every table from a manifest and one command | No manifest, no claim |
 
 ## 8. Claim discipline
@@ -381,48 +411,99 @@ Avoid claims that the data does not support:
 - "Coverage" requires an independent calibration split and an empirical check.
 - "Full head is optimal at high batch" is kernel-dependent; report the union
   efficiency.
-- "Head speedup" is not "end-to-end speedup"; report the head share.
+- "Head speedup" is not "end-to-end speedup"; report the head share and the
+  zero-head bound.
+- "Higher tau" is not automatically a server win; a lower-tau point can win on
+  throughput or ITL. Report both sides of the trade.
+- "Parameter share" is not "step-time share"; head-share claims must use measured
+  latency, not weight counts.
 
-## 9. Recommended six-week sequence
+### 8.1 Prior-art watchlist (2026-11)
 
-### Week 1
+These are the closest systems/papers for a submission; they must appear as
+baselines or explicit related work:
 
-- xgrammar adapter and B3 replay format.
-- Plan cache integration and compile-time metrics.
-- Tiny-M kernel prototype and clock-fixed benchmark.
+- **TableTune** (arXiv:2610.38968) — measured batch/draft-length tables in vLLM.
+- **APEX** (arXiv:2610.07780) — request-level drafter selection + depth control.
+- **SpecSearch** (arXiv:2611.22296) — joint strategy/draft-length/precision
+  search.
+- **ForeSpark** (arXiv:2611.13442) — joint draft/verify budget scheduling.
+- **Raptor** (arXiv:2611.25436), **DScale** (arXiv:2609.37532), **ASPIRE**
+  (arXiv:2609.17943) — adaptive draft/verify budgets.
+- **SlimSpec** (arXiv:2605.10453), **SpecVocab** (arXiv:2602.13836),
+  **DynaSpec** (arXiv:2510.13847), **VocabTrim** (arXiv:2506.22694),
+  **NarrowSpec** (arXiv:2611.23835), **Weights That Stay** (arXiv:2611.00506) —
+  draft-head/vocabulary cost.
+- **FactorSpec** (arXiv:2611.02297), **SchemaFill** (arXiv:2610.07086),
+  **MobiInfer** (arXiv:2611.08496) — structured/tool-call speculative drafting.
+- **vLLM grammar-aware draft sampling** (PR #47885) — worker shadow + grammar
+  guidance; compare against the mask-only control.
 
-### Week 2
+The project should not claim novelty for the generic controller or for a static
+`k` table; those are covered. The defensible claim is the **exact valid-set
+contract + row slicing + unified candidate-source/guarantee** evaluated at the
+server level against these systems.
 
-- Union/tree executor with numerical tests.
-- vLLM strict adapter and greedy/validity tests.
-- Cost-model recalibration from B2.
+## 9. Recommended next sequence
 
-### Week 3
+### Stage 0 — server-level upper bound
 
-- End-to-end strict run on structured workloads.
-- Head-share and tau decomposition.
-- Fix the largest overhead source (launch, gather, or plan compile).
+- Normalize existing paired runs into source x k x workload cells.
+- Compute the best fixed configuration, a per-workload router, and a per-cell
+  oracle.
+- Compute the zero-head bound from measured full-head time and step time.
+- If the oracle is within ~10% of the best fixed configuration, do not build a
+  complex controller; invest in a different lever.
 
-### Week 4
+### Stage 1 — engine wiring and routing
 
-- Artifact builder and router/static screener.
-- Candidate-set cache and calibrated mode.
-- Conformal calibration on a held-out split.
+- Wire the measured profile policy (enabled cell -> slice; otherwise built-in
+  full). **Adapter-level "no grammar in this batch" routing is implemented**
+  (`DRAFTSLICE_VLLM_ROUTER=1`), but the 4B/B8 routing experiment shows that a
+  blanket structured slice is a regression; the profile table is the required
+  gate. A server-level gateway is optional and model-dependent.
+- Use a per-model `k` table; measure whether a lower-`tau` point improves the
+  server metric. **The measured table is per model/workload/batch; a per-cell
+  learned router overfits 1-5-repetition cells.**
+- Report head share, TTFT/ITL, throughput, validity, and fallback rates.
 
-### Week 5
+### Stage 2 — production blockers
 
-- B1 baseline matrix (static, low-rank, CFHead-like, FlashHead-like,
-  DynaSpec-like, CHESS).
-- Pareto selection at iso-bytes and iso-latency.
+- TP>1 sharding, quantized LM-head path, CUDA-graph-safe slicing: code-complete
+  and unit-tested; real-engine gates remain per cell. Quantized rows dequantize
+  per candidate row; unsupported scale layouts fail closed to a full head masked
+  to V. FULL-graph step 0 uses a pre-replay static packed bitmask; step≥1 stays
+  full head.
+- SGLang EAGLE/DFlash and a B4 runner. **Still open.** SGLang MTP step-0 and
+  local TP rows are validated.
+- Engine metrics for capture/replay/fallback and head-share timings.
 
-### Week 6
+### Stage 3 — calibrated/free-form Pareto
 
-- B4 end-to-end calibrated run.
-- Release report, negative results, reproduction commands.
+- Low-rank/router artifacts at iso-quality and iso-memory, not only iso-bytes.
+- Conformal coverage on an independent split.
+- A positive server point, or an explicit negative result; do not ship a
+  policy-only table as a latency claim. **A frequency-top-16k static screener on
+  free-form at B=8 halved `tau` and throughput; explicit negative.**
+
+### Stage 4 — DFlash all-position
+
+- Mask all block positions sequentially with an advanced grammar matcher.
+  **Implemented (greedy, exact shadow, opt-in) and batch-gated.**
+- If the acceptance gain is real, design the corresponding per-position slice.
+  **The acceptance gain is real (tau 2.7 -> 5.1 at B=1), but all-position
+  masking loses above B=1 because the per-position grammar/argmax work scales
+  with batch. A per-position slice remains deferred.**
+- This is the only current path with a potential >1.2x head-share ceiling.
+  **Measured 1.2-1.3x at B=1; no >1.2x server result at B>=8.**
+
+### Stage 5 — release
+
+- Multi-seed B1-B4, manifests, negative results, reproduction commands.
 - Decide: strict-first product, calibrated-first product, or both.
 
 ## 10. The one-sentence strategy
 
-**Win on structured and calibrated workloads by owning the contract between
-grammar state, candidate plan, exact rescoring, and cost-aware scheduling — not
-by trying to out-compress low-rank heads on their own best case.**
+**Win at the server level by owning the contract between grammar state, candidate
+source, execution plan, and the tau/latency operating point — not by claiming a
+head speedup that the measured step time does not support.**

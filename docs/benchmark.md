@@ -1,8 +1,14 @@
 # DraftSlice benchmark plan
 
-Status: proposed, pre-alpha. This document defines what DraftSlice must measure,
-how to measure it, and what counts as a valid result. It does not report
-benchmark results.
+> **Production status 2026-11-22:** see
+> [`production-architecture.md`](production-architecture.md). B4 must compare
+> against the **best built-in** action in the same cell, not stock DFlash. The
+> 4B/B8 strict slice is a measured regression; built-in is the default and
+> DraftSlice is enabled only by a measured profile cell.
+
+Status: active design, pre-alpha. B0/B1/B2/B3/B4 runners and the release
+manifest/report pipeline are implemented. Dataset adapters, an SGLang B4 runner,
+and multi-seed release results remain operator work.
 
 Related documents:
 
@@ -19,9 +25,10 @@ measurement tier.
 | C1 | Strict mode never drops a grammar-valid token. | B0/B3 coverage and plan checks; B4 output equality |
 | C2 | DraftSlice is on the accuracy/resource Pareto frontier. | B1 head-quality curves at iso-bytes and iso-latency |
 | C3 | Slicing and screening reduce measured head latency, not just MACs. | B2 kernel microbench with roofline and effective bandwidth |
-| C4 | The gain survives end-to-end speculative decoding. | B4 acceptance length, throughput, and latency |
+| C4 | The gain survives end-to-end speculative decoding. | B4 throughput, TTFT/ITL, cost, and the tau tradeoff |
 | C5 | The result is robust to distribution shift and configuration. | B1/B4 robustness matrix; calibration checks |
 | C6 | The result is reproducible. | manifests, hashes, seeds, one-command reports |
+| C7 | The operating point is chosen for the server, not for tau. | tau/latency Pareto; throughput or tail latency at fixed quality |
 
 A result that only reports top-1 accuracy, or only MACs, or only a single
 hand-picked configuration, is not sufficient.
@@ -45,6 +52,10 @@ hand-picked configuration, is not sufficient.
    before the run; exploratory metrics are labeled as such.
 8. **No cherry-picking.** A release report includes all pre-registered workloads,
    including those where DraftSlice loses.
+9. **Optimize the server, not tau.** Acceptance length is a diagnostic. A lower
+   `tau` is acceptable when it removes draft/verify work and improves throughput,
+   TTFT, or tail ITL at the same quality. Conversely, a higher `tau` is not a win
+   if the server metric does not improve. Every trade must be explicit.
 
 ## 3. Benchmark tiers
 
@@ -256,6 +267,12 @@ For strict constrained decoding, `output_validity` must be 1.0 by construction. 
 it is not, the run is invalid and the bug must be fixed before performance is
 reported.
 
+`tau` is **not** a monotonic quality gate. A configuration with lower `tau` can
+be the better server point if it reduces draft/verification work. Report
+`throughput_tok_s`, TTFT, and ITL percentiles for every `tau` point and state
+whether the trade was intentional. The only hard constraints are output validity,
+the pre-registered quality metric, and the target SLO.
+
 ### 6.6 Quality-invariance checks
 
 Speed is meaningless if output quality changes silently.
@@ -412,26 +429,33 @@ Procedure:
 If the engine cannot run a configuration, report it as unsupported rather than
 dropping it silently.
 
-The first vLLM matrix compares `mtp` with `draftslice_mtp` on the same model,
-sampler, seed, batch, and workload. Slicing is disabled by default because the
-worker's captured grammar bitmask is one state ahead of the draft token; enabling
-it with `DRAFTSLICE_VLLM_SLICE=1` is an experiment, not a strict claim. The
-default `draftslice_mtp` path is a pass-through with explicit counters, so the
-B4 gate first checks no regression, then evaluates the experimental slice path.
+The first vLLM matrix compares the best built-in method (usually `mtp`) with
+`draftslice_mtp` on the same model, sampler, seed, batch, and workload. The
+worker-side xgrammar shadow provides the exact next-state valid set on supported
+rows, so the old one-step-ahead bitmask is no longer the draft state source.
+Slicing is profile-gated: TP>1, quantized rows, FULL-graph step 0, local-argmax,
+and reasoning boundaries have concrete code paths, but each is enabled only by a
+cell whose same-run gate passes. The 4B/B8 experiment found a blanket structured
+slice is a regression (0.767× mixed workload), so B4 must report the built-in
+baseline and the profile decision, not just a slice-vs-stock ratio.
 
 Report the speculator's `sliced_calls`, `fallback_calls`, `sliced_rows`,
-`full_rows`, `slice_disabled_calls`, and `mask_stride`
-(`DRAFTSLICE_VLLM_DEBUG=1`) alongside tau and throughput. A strict claim needs
-greedy equality and 100% output validity; a lower tau with the same validity is a
-regression, not a win. The current safe default is expected to match the
-baseline; the experimental slice path must not be reported as a win until a
-worker-side grammar shadow fixes the state timing.
+`full_rows`, `slice_disabled_calls`, `block_step0_rows`, and `mask_stride`
+(`DRAFTSLICE_VLLM_DEBUG=1`) alongside tau and the server metrics. A strict claim
+needs greedy equality and 100% output validity. A lower `tau` is not
+automatically a regression: it is accepted when the server metric improves, and
+rejected when it does not. A head-only speedup is not an end-to-end claim; report
+the measured draft-head share of the step and the zero-head upper bound.
 
 The DFlash matrix uses the public `z-lab/Qwen3.5-4B-DFlash` draft, block sizes 8
-and 16, and the same target/workload. The first DFlash adapter is not allowed to
-slice block positions from a single captured bitmask; it must either receive a
-per-position grammar state or fall back to the full head. Report block-position
-sliced/fallback counts and acceptance per position.
+and 16, and the same target/workload. `draftslice_dflash` slices block position 0
+with the exact worker shadow; the opt-in all-position path masks every block
+position under greedy, with a fused packed-bitmask kernel and a batch gate
+(default 1; operators may raise to 8). Positions 1..N-1 still do not slice, and
+per-position slicing remains a separate experiment. Report block-position
+sliced/mask/fallback counts and acceptance per position. A DFlash result must be
+compared with built-in MTP in the same run; “1.28× over stock DFlash” is not a
+production claim.
 
 ## 8. Benchmark matrix
 
@@ -757,8 +781,11 @@ These are project targets, not measured results.
 - Cost model: median absolute percentage error ≤ 25% on held-out shapes.
 - Head quality: a point at ≤ 5% of full-head bytes with no worse than a
   pre-registered OA/top-1 drop on structured workloads.
-- End-to-end: speedup > 1.0 at batch ≥ 8 on structured workloads; no regression
-  on free-form workloads; target > 1.2 in the best structured configuration.
+- End-to-end: a server-level win at batch ≥ 8 on structured workloads; no
+  server regression on free-form workloads; target > 1.2 in the best structured
+  configuration. Report the best throughput/TTFT point, not the best `tau` point.
+- Tau tradeoff: every lower-`tau` point must state the server metric that
+  improved; a lower `tau` with no server gain is a regression.
 - Calibrated coverage: within ±2 percentage points of nominal, with a confidence
   interval that contains the nominal value.
 - Cache: report cold/warm hit rates; no claim without both.

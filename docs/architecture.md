@@ -1,5 +1,9 @@
 # DraftSlice architecture plan
 
+> Production defaults and the measured profile policy are in
+> [`production-architecture.md`](production-architecture.md). This file is the
+> component and milestone reference; §0 and §18 track implementation status.
+
 Status: pre-alpha, core implemented. This document describes the target
 architecture and the contracts between components. It does not report benchmark
 results. Sections 13 and 18 track what is implemented and what remains.
@@ -13,22 +17,42 @@ Related documents:
 
 ## 0. Implementation snapshot
 
+Status date: 2026-11-22. There are two execution layers, and they must not be
+confused:
+
+- **Offline plan layer**: plan/compiler, cost model, scheduler, acceptance model,
+  union executor, candidate/row caches, screeners, artifacts, and release
+  tooling. These are implemented and unit-tested, but they are **not yet the
+  production engine hot path**.
+- **Engine fast path**: the vLLM and SGLang adapters currently consume an exact
+  `TokenSet` from the worker grammar shadow and call `build_draft_logits` / the
+  fused row kernel directly. This is the path with real-engine runs.
+
 Completed:
 
 - M0 skeleton.
-- M1 plan core: types, strict compiler, serialization, plan cache (now wired into
-  the compiler), reference executor, reference constraint fixture, CLI compile.
+- M1 plan core: types, strict compiler, serialization, plan cache (wired into the
+  compiler), reference executor, reference constraint fixture, CLI compile.
 - M2 runtime foundation: roofline cost model and A100/H100 profiles, native and
   grouped layouts, candidate-set cache, packed-row cache, deadline-aware
   strict/full scheduler, B1 harness, B2 kernel runner, B3 constraint replay.
 - M3 eager kernels: row-block GEMV for `B=1`, tensor-core slice GEMM for
   `B>=2`, shape dispatch tables for `B=1..64` and `m=1..65536`, a CUDA-graph
   replay cache, an opt-in runtime autotuner, graph parity for the full-head and
-  gather baselines, and union/tree execution with per-node scatter.
-- M4 first cut: vLLM plugin with `draftslice_mtp`, `draftslice_eagle3`, and a
-  safe pass-through `draftslice_dflash`, grammar bridge, experimental
-  draft-step-0 slicing, and full-head fallbacks. TP>1 and quantized heads still
-  fall back safely.
+  gather baselines, and union/tree execution with per-node scatter. The
+  tree-specific fused union kernel and engine-owned graph buckets are still open.
+- M4 integration: vLLM plugin with `draftslice_mtp`, `draftslice_eagle3`, and
+  `draftslice_dflash`; grammar bridge; worker-side xgrammar shadow advanced by
+  the verified tokens; per-position forks for `spec_tokens>1`; draft block
+  position 0 slicing; full-head fallbacks. TP>1 slices each rank's contiguous
+  vocabulary shard and scatters the result back to global token-id columns;
+  ranks with no local candidate use the full head masked to V. Quantized
+  fp8/int8 heads dequantize candidate rows; unsupported scale layouts fall back
+  to a full head masked to V. FULL decode graphs refresh a static packed bitmask
+  before replay and use `mask`/full for step≥1; local-argmax reduction uses a
+  sliced `get_draft_top_tokens` override. Every decision emits a `DraftContract`
+  with the fail-closed reason. These paths are code-complete and unit-tested;
+  real-engine gates are tracked per profile cell.
 - M5 baseline and calibration core: shared policy interface plus full/static/SVD/
   trained low-rank/group/router/oracle and CFHead/FlashHead/VocabTrim reference
   policies; vocabulary partition, split-conformal calibration, artifact bundle
@@ -39,8 +63,7 @@ Completed:
   and `PlanCompiler.compile_screened` / `compile_step(screener=...)` enforce
   `A := A ∩ V` for constrained-calibrated, keep `A` for free-form, reject a
   screener in strict mode, and fall back to the full head on empty/over-budget
-  rows. The compiler and the offline baseline runner share the same protocol.
-  The vLLM adapter can opt into the same constrained intersection
+  rows. The vLLM adapter can opt into the same constrained intersection
   (`DRAFTSLICE_VLLM_SCREENER`) on top of its worker-side grammar shadow, with
   per-call candidate/drop counters and a full-head fallback on screener errors
   or empty intersections. Screener artifacts (`screener/1` bundles) and
@@ -49,14 +72,15 @@ Completed:
   free-form mode while still intersecting whenever a grammar state exists.
 - Screened-plan cache keys include the candidate token tuple, delta, universe,
   calibration id, budget, and layout, so the same grammar state with a different
-  hidden state cannot reuse a stale candidate plan.
+  hidden state cannot reuse a stale candidate plan. The engine fast path does not
+  use those keys yet.
 - M5 training/evaluation: `screen.router` trains an MLP router from group
   marginals, `screen.artifacts` serializes full/static/group/router/low-rank
   screeners into verified bundles, and `bench.factorial` runs a screener x
   workload matrix with coverage and candidate-cost cells.
 - M6 release tooling: `bench.release` writes hashed release manifests and
   Markdown reports for every implemented result schema, verifies hashes, and
-  comparable releases for B5 regressions. The SGLang adapter is a real general
+  compares releases for B5 regressions. The SGLang adapter is a real general
   plugin: it slices draft block position 0 from the per-request grammar mask and
   keeps later positions on the full head. The vLLM DFlash adapter does the same
   for block position 0 with the exact worker shadow; later block positions stay
@@ -64,21 +88,42 @@ Completed:
   Qwen3.5-0.8B MTP; vLLM Qwen3.5-4B + 4B-DFlash).
 - xgrammar adapter for JSON Schema and regex sessions, including B3 trajectory
   recording.
-- B4 vLLM end-to-end runner (`draftslice bench e2e`) and a first
-  `mtp` vs `draftslice_mtp` sweep.
+- B4 vLLM end-to-end runner (`draftslice bench e2e`) with structured, free-form,
+  and DFlash cases; a diagnostic full-head+grammar-mask control
+  (`DRAFTSLICE_VLLM_FULL_MASK=1`) separates acceptance effects from slicing.
 - Numerical and shape tests for the torch and Triton kernels; fixed-clock B2
   performance runner.
+- 2026-11-22 research closeout and routing experiments (all opt-in): an
+  adapter-level workload router takes the stock path for all-free-form batches;
+  a DFlash all-position grammar mask masks every block position under greedy
+  sampling. The unfused mask wins at B=1 and loses at B>=8; the fused packed
+  mask removes the high-batch penalty, so all-position masking is batch-gated
+  (default 1, operator may raise to 8). A static free-form screener is a
+  measured negative. The production routing experiment found that a blanket
+  structured slice is a regression on 4B/B8 (0.767× mixed workload), so the
+  default is built-in and DraftSlice is profile-gated; see
+  `docs/production-architecture.md` §1–§2.
+
+Evaluation policy: the objective is **server-level throughput / TTFT / ITL /
+cost under quality and validity constraints**, not acceptance length alone.
+`tau` is a tunable metric and may be deliberately traded for lower draft or
+verification latency when the server operating point improves. Every such result
+must report both `tau` and the server metric.
 
 Still open (details in §18):
 
-- stable cross-request xgrammar state hashing and a full grammar replay corpus;
-- optimized TP sharding and quantized LM-head paths (safe fallbacks exist);
-- the DFlash per-block adapter for positions > 0 (block-position grammar state is
-  not available before sampling);
-- calibrated end-to-end runs on the full dataset mix and a multi-seed release
-  run on the reference hardware;
-- real-engine SGLang validation is complete for Qwen3.5 built-in MTP; validate
-  additional SGLang model families and TP > 1 as follow-up.
+- wiring the offline plan/cost/scheduler/union/cache layer into the engine hot
+  path under the measured profile table (default full);
+- the DFlash per-position **slice** (all-position *masking* is implemented behind
+  an opt-in, batch-gated flag; a per-position slice needs a sequential block
+  sampler);
+- measured profile cells for 4B B=1 tool, 35B-A3B tool, and DFlash-vs-MTP;
+  a blanket structured slice is a measured negative on 4B/B8;
+- SGLang EAGLE/DFlash hooks and an SGLang B4 runner (MTP step-0 is validated);
+- calibrated/free-form end-to-end results with a positive server-level Pareto
+  point and measured coverage (the first static point is a measured negative);
+- multi-seed release runs on the reference hardware;
+- cost-model calibration (MAPE) and scheduler validation on real traces.
 
 
 ## 1. What we are building
@@ -104,8 +149,12 @@ There are two product paths, and they must not be confused:
    head, but it can carry a finite-sample coverage guarantee. It may be applied
    to the full vocabulary or inside a constrained valid set.
 
-Both paths use the same plan format, cache, cost model, executor, and scheduler.
-The difference is the **guarantee**, not the plumbing.
+The two paths are **designed** to share the same plan format, cache, cost model,
+executor, and scheduler. This is the target architecture. In the current engine
+fast path, the adapters construct exact `TokenSet`s and call the row kernel
+directly; the offline plan/cost/scheduler/union/cache layer is not yet the
+production path. The difference between the paths is the **guarantee**, not the
+plumbing, once that wiring is complete.
 
 ### 1.1 Assumptions and non-goals
 
@@ -556,8 +605,13 @@ Initial implementation: prefix-coverage proxy plus measured next-token agreement
 (`sumC6`, `Δτ_prefix`) from the evaluation harness. Later: an online estimator
 updated from accepted tokens.
 
-Objective: maximize expected accepted tokens per unit predicted latency, or
-minimize predicted latency subject to `expected_tau >= min_expected_tau`.
+Objective: maximize **server-level** throughput (or minimize TTFT/ITL) subject to
+validity, quality, and a tail-latency budget. `tau` is a decision variable, not
+an invariant: if reducing draft/verify work lowers server latency or raises
+tokens/s, the scheduler may deliberately choose a lower-`tau` point. The plan and
+result must report both `tau` and the server metric, plus the reason for the
+trade. `min_expected_tau` is an optional constraint for deployments that need a
+minimum acceptance floor.
 
 Strict-mode constraints are checked before the objective. If the strict plan is
 over budget, the scheduler must first reduce tree width/depth, then fall back to
@@ -588,6 +642,19 @@ The planner uses predicted latency; the benchmark suite reports predicted vs
 measured error. A model that is not calibrated for the target GPU must be marked
 as such and must not be used to claim speedups.
 
+For server planning, the model must also expose the **draft-head share of the
+measured speculative step**. A head-only speedup is not a server speedup: the
+same 10× head improvement can be 1% or 20% end-to-end depending on the model,
+batch, k, engine overlap, and target-verification width. Every performance
+report must state the measured share and the server metric, not only head
+latency.
+
+The share is not a constant across `k`: reducing draft depth removes whole head
+evaluations, so a lower-`tau` configuration can remove more head work than the
+per-call head time suggests. Conversely, a higher `k` can raise `tau` while
+lowering server throughput. The scheduler must evaluate the joint `(k, source,
+budget)` point on the server metric.
+
 ### 5.9 Integrations
 
 ```python
@@ -605,6 +672,10 @@ class DraftPathAdapter(Protocol):
 - The core owns plan compilation, caching, execution, and scheduling.
 - Engine versions are pinned in optional extras; integration tests are skipped
   when the engine is not installed.
+
+The current engine fast path does **not** yet call this full protocol: it builds
+exact `TokenSet`s from the worker shadow and invokes the row kernel directly. See
+§0 for the boundary.
 
 ### 5.10 Observability
 
@@ -942,8 +1013,8 @@ DoD:
 - Reference executor matches full-head logits within tolerance.
 - Cache hit/miss behavior is tested.
 - `draftslice compile` works on the reference constraint fixture
-  (`valid_ids` / `states`). JSON Schema and CFG adapters are M2+ work and must
-  reject unsupported inputs clearly until then.
+  (`valid_ids` / `states`). JSON Schema and regex adapters are implemented via
+  xgrammar; CFG remains unsupported until a backend is added.
 
 ### M2 — runtime, cost model, scheduler
 
@@ -999,7 +1070,9 @@ DoD:
 
 - Strict mode output matches full-head constrained decoding under greedy.
 - Output validity is 100% on structured workloads.
-- End-to-end speedup is reported per workload and batch.
+- Server-level throughput, TTFT, ITL, and cost are reported per workload and
+  batch, together with `tau` and the head-share decomposition. A result may trade
+  `tau` for server latency; it must state that it did.
 - No core import of vLLM in unit tests.
 
 ### M5 — screener and calibrated mode
@@ -1064,6 +1137,12 @@ DoD:
   the fallback must be fast and clearly reported.
 - **Tree planning.** State grouping and union execution need real grammar
   traces; synthetic states are not enough.
+- **Head share / Amdahl.** A head-only speedup is bounded by the draft head's
+  share of the measured server step. Parameter share is not step-time share;
+  measure both and report the zero-head ceiling.
+- **Tau/latency tradeoff.** Lowering `tau` can raise throughput when it removes
+  draft/verify work, but it can also lower it by adding rounds. Validate any
+  trade on the server metric, not on `tau` alone.
 - **Default mode.** Strict is safe but may be slower; calibrated is faster but
   changes acceptance. The default must be explicit in config and docs.
 
@@ -1084,19 +1163,25 @@ into contracts:
 Pilot numbers must not be copied into public docs as benchmark results. They are
 inputs to the benchmark design, not the report.
 
-## 16. vLLM integration (first cut)
+## 16. vLLM integration
 
 The first vLLM integration is a **strict-mode draft-step-0** path. It is
 registered as a vLLM general plugin and exposes two custom speculative methods:
 
 - `draftslice_mtp` (wraps vLLM's `MTPSpeculator`);
 - `draftslice_eagle3` (wraps vLLM's `EagleSpeculator`);
-- `draftslice_dflash` (wraps `DFlashSpeculator` as a safe pass-through until
-  per-block grammar state exists).
+- `draftslice_dflash` (wraps `DFlashSpeculator`; block position 0 is sliced,
+  later positions use the full head because their grammar state is sampled
+  inside the same parallel block).
 
-Slicing is **disabled by default** because the captured bitmask is one grammar
-state ahead of the draft token. `DRAFTSLICE_VLLM_SLICE=1` enables it for
-experiments; the B4 runner and debug counters record the fallback rate.
+The worker-side xgrammar shadow is advanced by the tokens the target actually
+sampled, so the draft sees the exact next grammar state (not the one-step-ahead
+scheduler bitmask). Slicing is still **opt-in** (`DRAFTSLICE_VLLM_SLICE=1`) in the
+current build: it is safe on supported eager/TP=1/unquantized paths, but it is a
+regression on free-form and some workloads, and it cannot run inside a FULL
+decode CUDA graph. The default is therefore a pass-through until per-workload
+routing and graph/TP/quantized support land. The B4 runner and debug counters
+record the fallback rate.
 
 Entry point:
 
@@ -1135,6 +1220,11 @@ For each batch row with a captured valid set:
 The logits processor's `scale` and `soft_cap` are applied to the sliced values so
 the draft distribution matches the full-head path.
 
+`DRAFTSLICE_VLLM_FULL_MASK=1` is a diagnostic control, not a product mode: it
+computes the full draft head and then applies the same exact grammar mask. It
+separates the **acceptance** effect of grammar-aware drafting from the **latency**
+effect of slicing. It is off by default.
+
 When `DRAFTSLICE_VLLM_SCREENER` names a registry source, the adapter first asks
 that source for candidates on the draft hidden states and then intersects them
 with the exact valid set for each row (`A := A ∩ V`). Only candidate selection is
@@ -1152,9 +1242,9 @@ true:
 - `DRAFTSLICE_VLLM=0`;
 - no grammar snapshot was captured;
 - the draft step is not 0;
-- the draft LM head is tensor-parallel (`tp_size != 1`);
+- the LM head's tensor-parallel shard layout cannot be proven from its metadata;
 - the LM head is quantized;
-- the weight dtype is not bf16/fp16/fp32;
+- the weight dtype is neither bf16/fp16/fp32 nor a supported fp8/int8 quant;
 - the logits processor has `logits_as_input=True`;
 - the valid set is empty or larger than `DRAFTSLICE_VLLM_MAX_ROWS`;
 - the configured screener cannot be built or raises on `candidates()`;
@@ -1162,28 +1252,62 @@ true:
 - any exception occurs during plan construction or kernel execution.
 
 `DRAFTSLICE_VLLM_DEBUG=1` prints per-speculator call/slice/fallback counters to
-stderr. `draftslice_stats()` exposes the same counters on the speculator.
+stderr. `draftslice_stats()` exposes the same counters, the `fallback_reasons`
+histogram, TP rank/shard fields, and `last_contract` (the concrete
+`DraftContract` for the most recent step). Under TP>1 each rank scores only its
+own global-token-id range; a row whose valid set has no token on that rank keeps
+the full head but is masked to V before sampling, so a rank-local fallback can
+never propose a grammar-invalid token. The full-head row set is derived from
+*all* ranks' id ranges, so every rank enters vLLM's logits all-gather for the
+same rows; a rank-local decision would deadlock the TP engine. LOCAL-argmax
+reduction is supported through a `get_draft_top_tokens` override that slices the
+head and reproduces vLLM's `(value, id)` TP reduction. A quantized head whose
+scale layout cannot be mapped to rows keeps the full head with an exact mask.
 
-### 16.4 Known limitation: grammar-state timing
+### 16.4 Grammar-state timing and the worker shadow
 
-The captured bitmask is the **current target step's** bitmask. It describes the
-state before the token the target is about to sample, while the draft head must
-propose the token *after* that sample. On a changing grammar this is off by one
-state, and using it drops valid draft tokens. B4 acceptance measurements confirm
-the failure mode on tool-call schemas, so the safe default is **no slicing**;
-`DRAFTSLICE_VLLM_SLICE=1` is experimental only.
+The scheduler's grammar bitmask is computed **before** the target forward and is
+one state ahead of the token the draft must propose after the target samples.
+Using it directly drops valid draft tokens on a changing grammar, which is why
+the first cut was experimental.
 
-Draft step 0 is therefore not a strict claim in the first cut. A correct fix
-needs one of:
+The current integration fixes this with a worker-side xgrammar shadow
+(`vllm_shadow.py`):
 
-- a worker-side grammar shadow advanced by the verified token; or
-- a scheduler-provided per-position valid set for the draft block.
+- a matcher per request is compiled in the worker from the request's structured
+  output parameters;
+- `GPUModelRunner.postprocess_sampled` advances it by the tokens the target
+  actually sampled (accepted drafts plus the bonus);
+- for `spec_tokens>1`, a forked matcher is advanced by each sampled draft token,
+  so every draft position gets its own exact valid set;
+- with a reasoning parser, the shadow builds a per-request parser in the worker
+  and stays inactive until the end-of-reasoning boundary is observed in sampled
+  tokens; reasoning rows return no valid set (full head) and the grammar is only
+  fed the post-boundary token suffix;
+- valid sets are cached by grammar definition plus accepted-token prefix.
 
-The target verifier remains exact: invalid drafts are rejected and trimmed by
-vLLM's structured output path. The B4 test compares constrained greedy output
+Supported rows therefore use an exact valid set. The target verifier remains
+full-head exact: invalid drafts are rejected and trimmed by vLLM's structured
+output path.
+
+Slicing is still opt-in for **operational** reasons, not because the state is
+missing:
+
+- free-form rows have no grammar state and currently pay wrapper overhead;
+- FULL decode CUDA graphs cannot read step-0 candidate ids at replay without a
+  D2H sync (later-position sets are GPU-resident), so they use a static packed
+  bitmask + fused mask instead of head-row slicing;
+- a server-level router is not implemented yet (the adapter-level free-form
+  router is).
+
+A deployment that enables slicing should restrict it to structured workloads;
+TP>1, quantized heads, reasoning parsers, local-argmax reduction and FULL graphs
+all have concrete contracts. The B4 test compares constrained greedy output
 against the full-head constrained baseline, `output_validity == 1.0`, and draft
-acceptance/fallback rates. Until the shadow exists, `draftslice_mtp` is a
-pass-through with explicit counters.
+acceptance/fallback rates.
+
+`DRAFTSLICE_VLLM_SLICE=0` remains a safe pass-through with explicit counters;
+`DRAFTSLICE_VLLM_SLICE=1` enables the shadow + slice path for supported rows.
 
 ### 16.5 Usage
 
@@ -1201,7 +1325,10 @@ reported sliced calls.
 Environment controls:
 
 - `DRAFTSLICE_VLLM=0` disables slicing and keeps the wrapper as a pass-through.
-- `DRAFTSLICE_VLLM_SLICE=1` enables the experimental draft-step-0 slice path.
+- `DRAFTSLICE_VLLM_SLICE=1` enables the shadow + draft-step-0 slice path for
+  supported rows; `0` keeps the safe pass-through.
+- `DRAFTSLICE_VLLM_FULL_MASK=1` enables the diagnostic full-head + grammar-mask
+  control (no slicing), for separating acceptance from latency.
 - `DRAFTSLICE_VLLM_MAX_ROWS` caps the strict slice size (default 32768).
 - `DRAFTSLICE_VLLM_SCREENER` names an opt-in `screen.registry` source (for
   example `static`, `group`, `lowrank`, `router`, `svd_lowrank`); candidates are
@@ -1217,6 +1344,20 @@ Environment controls:
 - `DRAFTSLICE_VLLM_CUDA_GRAPH=1` enables the kernel-level graph replay cache. It
   is opt-in because capture must not run inside the engine's own graph capture;
   capture failure falls back to eager.
+- `DRAFTSLICE_VLLM_ROUTER=1` routes an all-free-form batch through the stock
+  speculator path without shadow/mapping bookkeeping. It removes the wrapper
+  cost when no row has a grammar state and leaves structured rows unchanged.
+- `DRAFTSLICE_VLLM_BLOCK_ALLPOS=1` enables DFlash all-position grammar masking
+  under greedy sampling. It is batch-gated by
+  `DRAFTSLICE_VLLM_BLOCK_ALLPOS_MAX_BATCH` (default 1: all-position at B=1,
+  position-0 slice above that) and can be depth-capped with
+  `DRAFTSLICE_VLLM_BLOCK_ALLPOS_DEPTH`.
+- `DRAFTSLICE_VLLM_BLOCK_ALLPOS_FAST=1` applies the per-position bitmasks with
+  one packed upload and one fused Triton launch instead of unpacking per row.
+  It removes the B>=8 penalty of all-position masking; default-off for now.
+- `DRAFTSLICE_VLLM_DETERMINISTIC=1` skips the draft head for rows whose valid
+  set contains a single token. It is a negative result on the reference tool
+  schemas (no such rows occur with xgrammar), kept as a research control.
 - `DRAFTSLICE_VLLM_DEBUG=1` prints counters to stderr.
 
 ## 17. Fair baseline suite
@@ -1326,8 +1467,9 @@ The tiny-M target is only meaningful under this rule.
 
 ## 18. Remaining design
 
-The following pieces are deliberately not implemented yet. They are the next
-architecture work, in order.
+The following pieces are the remaining architecture work. Some are implemented
+offline but not wired into the engine hot path; others are not implemented yet.
+Status is stated per item.
 
 ### 18.1 Union/tree execution
 
@@ -1338,10 +1480,13 @@ kernel-crossover benchmarks at B=1/8/32/64 with real grammar traces.
 
 ### 18.2 Scheduler v2
 
-The acceptance model, `min_expected_tau`, and `choose_best` are implemented. What
-remains is fitting the prefix-coverage model on real B1/B4 traces and validating
-the predicted `tau` against measured acceptance, then wiring the scheduler into
-an engine adapter.
+The acceptance model, optional `min_expected_tau`, and `choose_best` are
+implemented. What remains is fitting the prefix-coverage model on real B1/B4
+traces, validating predicted `tau` against measured acceptance, adding server
+metrics (throughput/TTFT/ITL/cost) to the objective, and wiring the scheduler
+into an engine adapter. The scheduler must be allowed to choose a lower-`tau`
+point when the server metric improves; `min_expected_tau` is an optional floor,
+not a universal constraint.
 
 ### 18.3 Artifact builder and calibrated screener
 
@@ -1358,19 +1503,43 @@ repository does not ship datasets or result files.
 
 ### 18.4 vLLM hardening
 
-- Support TP > 1 by sharding the valid row set across ranks or falling back per
-  rank.
-- Support quantized LM heads through the quant method, not raw weights.
-- Validate grammar-state timing against real structured traces.
-- Wire `screen.registry` sources (static/low-rank/group/router) into the
-  draft-logits hook; the constrained and free-form screener paths are
-  implemented, and the remaining gap is TP/quantized draft heads and per-request
-  calibration artifacts.
+- TP > 1 is supported: the adapter detects the rank's contiguous vocab range
+  from the head's shard metadata, slices only that rank's weight rows, and
+  scatters logits to global token-id columns. A rank with no local candidate
+  takes a full-head fallback masked to V; the full-head row set is derived from
+  all ranks' id ranges so the TP logits all-gather stays balanced. The custom
+  method's config path and end-to-end slicing were verified under vLLM 0.34
+  TP=2 (Qwen3.5-0.8B structured JSON, valid output, `sliced_calls > 0` on both
+  ranks); the previous config-resolution failure no longer reproduces.
+- Quantized heads: a quant config no longer rejects a bf16 head outright; fp8/int8
+  weights are dequantized per candidate row (`quant_dequant.py`) and cached, so
+  the same sliced kernels apply. Unknown scale layouts fail closed to a full head
+  masked to V with a recorded reason.
+- FULL decode graphs: a static packed bitmask is refreshed from the step-0 shadow
+  in `propose()` before each replay and applied by the fused mask kernel; step≥1
+  stays full head because its state is GPU-resident. Local-argmax reduction uses
+  a `get_draft_top_tokens` override with the same `(value, id)` TP reduction as
+  vLLM. Reasoning parsers gate the shadow on the observed reasoning boundary.
+- Wire a **workload router** so structured/eager/TP=1 requests use the slice path
+  and free-form/unsupported requests take the full path by default. The
+  adapter-level "no grammar in this batch" branch is implemented
+  (`DRAFTSLICE_VLLM_ROUTER`); the remaining piece is a **server-level** router
+  that also sends short structured workloads with no acceptance gain (for
+  example small JSON arrays or regex fills) to the built-in speculator.
+- Add per-request calibration artifacts and coverage monitoring for calibrated
+  modes.
 - CUDA graph buckets for dynamic candidate sizes. The kernel-level
   `CudaGraphCache` exists; the adapter must still keep a stable hidden workspace
   and row buffer.
 - Expose stats through the engine metrics path, including graph
-  capture/replay/fallback counters.
+  capture/replay/fallback counters and head-share/timing fields.
+- Replace the fixed `spec_tokens` default with a server-level k/source choice
+  that may trade `tau` for throughput or tail latency.
+
+The constrained/free-form screener hook (`DRAFTSLICE_VLLM_SCREENER` /
+`_ARTIFACT` / `_UNIVERSE`) is implemented; the remaining gap is production
+routing, TP/quantized support, per-request calibration, and measured server
+Pareto results.
 
 ### 18.5 DFlash
 
@@ -1402,12 +1571,20 @@ position. The implemented policy is:
 2. positions 1..N-1 use the full draft head;
 3. if the shadow has no exact set, the whole block uses the full head.
 
-Per-position slicing for positions > 0 remains future work. It needs a
-grammar-aware block sampler (or a scheduler-provided per-position state); do not
-apply the position-0 set to later positions. The target verifier remains exact,
-but a wrong draft candidate set lowers acceptance and invalidates a "no valid
-draft token dropped" claim. The longer-term target design is a `StepPlan` with
-one node per block position, each node carrying its own `HeadPlan`.
+An opt-in all-position **mask** path (`DRAFTSLICE_VLLM_BLOCK_ALLPOS=1`) closes
+most of the acceptance gap for greedy decoding: it masks each position with its
+own exact set, takes the argmax to advance a forked matcher, and lets the engine
+sample from the masked logits. It is batch-gated by default
+(`..._MAX_BATCH=1`) because the per-position grammar/argmax work scales with
+batch and loses above B=1; above the gate the adapter uses position-0 slicing.
+The target verifier remains exact.
+
+Per-position **slicing** for positions > 0 remains future work. Masking does not
+reduce the head work: the block still computes the full head once. A slice would
+need a grammar-aware sequential block sampler that reuses the engine's sampled
+tokens; that serializes the block head and gives up the batched GEMM. The
+longer-term target design is a `StepPlan` with one node per block position, each
+node carrying its own `HeadPlan`.
 
 ### 18.6 SGLang
 
@@ -1415,9 +1592,12 @@ one node per block position, each node carrying its own `HeadPlan`.
   `EagleDraftWorker.draft` / `FrozenKVMTPDraftWorker.draft` to publish the batch
   grammar state, and `LogitsProcessor._compute_lm_head` to slice draft block
   position 0 through the shared row kernel. Later positions use the full head.
-- Unsupported heads (TP > 1, non-unquantized, CPU weight), missing/terminated
-  grammars, oversized valid sets, and any error fall back to the original full
-  head.
+- TP > 1 is supported: SGLang's `_compute_lm_head` returns rank-local logits
+  before its own TP gather, so the hook slices local weight rows with local ids
+  and returns local logits; no collective is needed inside the hook. Unsupported
+  layouts, CPU weights, missing/terminated grammars, oversized valid sets, and
+  errors still fall back to the original head with a recorded reason and a full
+  `DraftContract`.
 - End-to-end validated with SGLang 0.5.23 + Qwen3.5-0.8B and its built-in MTP
   (`speculative_algorithm="EAGLE"`, `speculative_draft_model_path` = target):
   step-0 slicing fires (`sliced_calls > 0`, candidates 2..443), structured JSON
@@ -1428,41 +1608,56 @@ one node per block position, each node carrying its own `HeadPlan`.
 ### 18.7 Release benchmark
 
 - B1 baseline matrix on UltraChat-200K + ShareGPT and structured workloads.
-- B2 fixed-clock kernel table.
+- B2 fixed-clock kernel table with head-share and zero-head-bound reporting.
 - B3 real grammar-state replay (the runner and xgrammar adapter exist).
-- B4 end-to-end matrix with validity, tau, throughput, and quality (the runner
-  exists; the first sweep is `mtp` vs `draftslice_mtp`).
+- B4 end-to-end matrix with validity, tau, throughput, TTFT/ITL, cost, and
+  quality (the runner exists; it is vLLM-only today).
+- A tau/latency Pareto: sweep `k`, candidate budget/source, and draft depth;
+  report the best server point, not only the best tau point. Sacrificing tau is
+  allowed when throughput or tail latency improves.
 - `draftslice bench report` builds a hashed manifest and Markdown report from
   any mix of B1-B4 results; `bench validate` and `bench compare` implement the
   B5 gate. Nightly/release workflows run the offline pipeline on synthetic data.
 - Remaining: publish multi-seed results for the prescribed dataset mix and the
-  reference GPU; the repository intentionally ships no datasets or result files.
+  reference GPU; add an SGLang B4 runner; the repository intentionally ships no
+  datasets or result files.
 
 ### 18.8 Kernel work remaining
 
 - A tree-specific fused union kernel; the current executor reuses the slice GEMM
   and scatters after the launch.
 - Engine-owned shape buckets with stable hidden and row buffers.
-- Quantized (fp8/int8) weight paths and optimized TP sharding; both currently
-  fall back to the full head.
+- Exotic quantization scale layouts (block/MX) that cannot be mapped to
+  candidate rows; common fp8/int8 rows already dequantize per row.
 - A split-K or persistent tiny-M kernel only if graph replay is not available in
   the target engine.
 
-### 18.9 B4 state-timing finding
+### 18.9 State timing, graph mode, and the server objective
 
-The first B4 sweep exposed a real blocker, not a tuning issue:
+The original B4 sweep exposed a real blocker: using the scheduler bitmask
+directly slices the draft head to the previous grammar state, drops valid draft
+tokens, and lowers acceptance. The worker-side shadow in §16.4 now fixes this on
+supported rows; the scheduler bitmask is no longer the draft state source.
 
-- with the captured bitmask used directly, the draft head is sliced to the
-  **previous** grammar state; on tool-call schemas this drops valid draft tokens
-  and lowers acceptance;
-- the safe default is therefore a pass-through with the full draft head, which
-  keeps output validity and greedy equality at 1.0;
-- enabling `DRAFTSLICE_VLLM_SLICE=1` is experimental until a worker-side grammar
-  shadow advances the state by the verified token, or the scheduler sends a
-  per-position valid set for the draft block;
-- vLLM CUDA-graph capture also runs a dummy full-head path unless the slice is
-  graph-safe, so engine-side buckets need a stable row buffer and a pre-replay
-  update hook.
+What remains is operational, not a state-timing blocker:
 
-This is exactly the risk described in §16.4. Do not report an end-to-end
-speedup from the current slice path.
+- **Graph mode:** a FULL decode CUDA graph bypasses the Python hook at replay,
+  but the adapter refreshes a static packed bitmask in `propose()` before replay;
+  step 0 emits a `mask`/full contract and later positions stay full-head with a
+  recorded reason. True per-row slicing inside the graph would require a D2H sync
+  for step≥1 states, so it is deliberately not attempted.
+- **TP/quantized heads:** TP>1 slices per-rank shards (vLLM) or local rows
+  (SGLang, gathered by the engine afterwards); quantized heads dequantize
+  candidate rows. Both paths emit a contract and a fallback reason.
+- **Routing:** free-form rows and some structured workloads regress if slicing
+  is enabled globally, so the production default is built-in and DraftSlice is
+  enabled only by a measured profile cell. The 4B/B8 routing experiment found
+  0.767× for a blanket structured slice; the single-profile built-in path is the
+  production default. See `docs/production-architecture.md` §1–§2.
+- **Server objective:** acceptance length is not the product metric. The next
+  evaluation must report throughput, TTFT/ITL, validity, and cost, and may
+  deliberately trade `tau` for a lower-latency operating point. A head-only
+  speedup or an acceptance-only improvement is not a server claim.
+- **Head share:** the draft head is a model/engine/workload-dependent fraction of
+  the step, not a constant. Measure it per deployment; do not import a
+  parameter-share estimate as an e2e ceiling.

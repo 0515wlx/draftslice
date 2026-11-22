@@ -1,8 +1,8 @@
 # DraftSlice design notes
 
-Status: public, pre-alpha. This document describes the intended system. It
-does not report benchmark results. The implementation plan is in
-[architecture.md](architecture.md); the evaluation plan is in
+Status: public, pre-alpha. This document describes the system and its contracts.
+It does not report benchmark results. The implementation status and remaining
+work are in [architecture.md](architecture.md); the evaluation plan is in
 [benchmark.md](benchmark.md).
 
 ## 1. Problem
@@ -14,11 +14,16 @@ For EAGLE, DFlash, and MTP drafters, the draft cost is
 T_draft = T_backbone + T_head
 ```
 
-For single-layer drafters the LM head can dominate the draft step. When the
-output is constrained by a grammar or JSON schema, only a subset of the
+For single-layer drafters the LM head can dominate the **draft forward**, and in
+large-vocabulary, small-batch, or low-bandwidth deployments it can be the largest
+single cost in the step. In other deployments the target verifier, attention, or
+MoE routing dominates. The docs therefore distinguish *draft-forward head share*
+from *server-step head share* and require the latter to be measured.
+
+When the output is constrained by a grammar or JSON schema, only a subset of the
 vocabulary can be proposed at each grammar state. A conventional pipeline still
-projects the hidden state to the full vocabulary and applies the mask
-afterwards, paying for rows that can never be proposed.
+projects the hidden state to the full vocabulary and applies the mask afterwards,
+paying for rows that can never be proposed.
 
 ## 2. Core idea
 
@@ -60,8 +65,16 @@ grammar / schema
 - **Executor**: `slice_gemv` for small slices, `slice_gemm` for packed hot
   slices, full/compressed fallback for large valid sets.
 - **Scheduler**: the plan cost is known before execution, so it can inform
-  draft depth, tree width, verify width, and latency budgets.
-- **Integrations**: vLLM and SGLang entry points (future milestones).
+  draft depth, tree width, verify width, and latency budgets. The objective is
+  the server metric (throughput, TTFT/ITL, cost), not `tau` alone; a lower `tau`
+  point is valid when it reduces latency or raises throughput.
+- **Integrations**: vLLM and SGLang adapters are implemented. The current engine
+  fast path uses the exact worker shadow + row kernel directly; the offline
+  plan/cost/scheduler/union layer is not yet the production hot path.
+- **Candidate sources**: exact grammar slicing, static/low-rank/group/router
+  screening, and full-head fallback share one screener interface; low-rank and
+  hierarchical sources are primarily a memory/coverage tradeoff, not a way to
+  exceed the head-share bound.
 
 ## 4. Scope
 
@@ -73,7 +86,9 @@ In scope:
 - caching plans and rows across requests/steps;
 - draft-aware scheduling;
 - composition with low-rank, subset, and sparse draft heads for free-form
-  states.
+  states;
+- server-level selection of `k`, candidate budget, source, and draft depth,
+  including deliberate `tau` reduction when it improves throughput or latency.
 
 Out of scope:
 
@@ -103,3 +118,7 @@ intended.
 - Reusing plans on the target side for constrained verification.
 - Scheduling head plans jointly with draft depth and tree width.
 - Composition with low-rank and sparse draft heads.
+- When to trade `tau` for lower server latency, and how to predict the crossover
+  from measured head share and verification cost.
+- Which candidate-source policy wins at iso-quality and iso-memory for free-form
+  workloads, as opposed to iso-latency.
