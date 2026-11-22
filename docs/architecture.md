@@ -52,7 +52,10 @@ Completed:
   before replay and use `mask`/full for step≥1; local-argmax reduction uses a
   sliced `get_draft_top_tokens` override. Every decision emits a `DraftContract`
   with the fail-closed reason. These paths are code-complete and unit-tested;
-  real-engine gates are tracked per profile cell.
+  real-engine gates are tracked per profile cell. A 2026-11-22 35B-A3B TP=2
+  gateway run hung in `draftslice_mtp` after 4 structured requests while the
+  built-in MTP TP=2 pool was healthy; MoE TP>1 remains gated until that hang is
+  fixed.
 - M5 baseline and calibration core: shared policy interface plus full/static/SVD/
   trained low-rank/group/router/oracle and CFHead/FlashHead/VocabTrim reference
   policies; vocabulary partition, split-conformal calibration, artifact bundle

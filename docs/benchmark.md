@@ -437,7 +437,9 @@ Slicing is profile-gated: TP>1, quantized rows, FULL-graph step 0, local-argmax,
 and reasoning boundaries have concrete code paths, but each is enabled only by a
 cell whose same-run gate passes. The 4B/B8 experiment found a blanket structured
 slice is a regression (0.767× mixed workload), so B4 must report the built-in
-baseline and the profile decision, not just a slice-vs-stock ratio.
+baseline and the profile decision, not just a slice-vs-stock ratio. A 35B-A3B
+TP=2 `draftslice_mtp` run hung after 4 structured requests while built-in MTP
+TP=2 was healthy; report TP>1 MoE as unsupported until that hang is fixed.
 
 Report the speculator's `sliced_calls`, `fallback_calls`, `sliced_rows`,
 `full_rows`, `slice_disabled_calls`, `block_step0_rows`, and `mask_stride`

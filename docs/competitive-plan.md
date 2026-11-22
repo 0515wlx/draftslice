@@ -16,10 +16,12 @@ adapter-level free-form router is implemented and recovers the free-form
 regression; the fused DFlash all-position mask wins at B=1 and is neutral at
 B=8, but only within the DFlash family; a static free-form screener is a
 measured negative. TP>1, quantized heads, and FULL-graph step-0 masking are
-code-complete and unit-tested; real-engine gates remain per cell. The 4B/B8
-routing experiment found that a blanket structured slice is 0.767× on a mixed
-workload, so the production default is built-in and DraftSlice is
-profile-gated. Results are in the local `runs/` workspace.
+code-complete and unit-tested; real-engine gates remain per cell, and a
+2026-11-22 35B-A3B TP=2 `draftslice_mtp` run hung while built-in MTP TP=2 was
+healthy, so MoE TP>1 is gated. The 4B/B8 routing experiment found that a blanket
+structured slice is 0.767× on a mixed workload, so the production default is
+built-in and DraftSlice is profile-gated. Results are in the local `runs/`
+workspace.
 
 Related documents:
 
@@ -470,10 +472,12 @@ server level against these systems.
 ### Stage 2 — production blockers
 
 - TP>1 sharding, quantized LM-head path, CUDA-graph-safe slicing: code-complete
-  and unit-tested; real-engine gates remain per cell. Quantized rows dequantize
-  per candidate row; unsupported scale layouts fail closed to a full head masked
-  to V. FULL-graph step 0 uses a pre-replay static packed bitmask; step≥1 stays
-  full head.
+  and unit-tested; real-engine gates remain per cell. 35B-A3B TP=2
+  `draftslice_mtp` hung after 4 structured requests while built-in MTP TP=2 was
+  healthy, so MoE TP>1 is a blocker. Quantized rows dequantize per candidate
+  row; unsupported scale layouts fail closed to a full head masked to V.
+  FULL-graph step 0 uses a pre-replay static packed bitmask; step≥1 stays full
+  head.
 - SGLang EAGLE/DFlash and a B4 runner. **Still open.** SGLang MTP step-0 and
   local TP rows are validated.
 - Engine metrics for capture/replay/fallback and head-share timings.

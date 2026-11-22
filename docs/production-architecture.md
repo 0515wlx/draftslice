@@ -24,9 +24,22 @@ Status: 2026-11-22. 本文是**唯一的生产架构基线**，替换此前的 v
 | `MAX_ROWS=512` per-row 大小门控 | JSON 仍 0.63–0.70×，regex 0.79–0.85×，router 中位 0.951× | **无效**；问题不是 valid-set 大小 | `runs/prod_routing_4b_k8_gate512_20261122.json` |
 | 2-pool gateway + DraftSlice k=8 结构化池（4B） | 0.907×，p99 1103 ms | **拒绝**；池化本身没问题，profile 负收益 | `runs/routing/results/gateway_0.5-0.3-0.2.json` |
 | per-workload k 路由（free k=8 / structured k=4，4B） | 均衡 mix +3.7% 但 p99 +10.9%；tool-heavy 0.957×，p99 +35.6% | **拒绝**；固定池在偏斜 mix 下输 | `runs/routing/results/gateway_mtp_k4_*.json` |
-| `|V|=1` deterministic injection | 308 次 draft call 中 0 次命中 | **不发布**（研究对照保留） | closeout 记录 |
+| `\|V\|=1` deterministic injection | 308 次 draft call 中 0 次命中 | **不发布**（研究对照保留） | closeout 记录 |
 | static free-form screener 16k | 0.49×，tau 2.60→1.34 | **拒绝**；calibrated 只用于内存/覆盖，不作为 latency 路径 | closeout 记录 |
-| DFlash all-position “1.28×” | 是 over **stock DFlash**，不是 over built-in MTP；B=1 tool MTP 仍更快 | **待 E3 同轮验证**，不得直接作为生产 claim | closeout 记录 |
+| DFlash all-position “1.28×” | 同轮 DFast vs stock DFlash 1.24×；但 vs built-in MTP：B1 +10.5%、B8 −1.6%；vs DraftSlice MTP B1 −10.7% | **4B tool 不启用 DFlash**；MTP slice k=8 更好 | `runs/prod_dflash_ds_20261122.json`、`runs/prod_dflash_mtp_20261122.json` |
+| 4B B=1 tool，k=4 strict slice | 均值 1.033×、中位 0.998×；k=8 是 1.286×/1.242× | **k=4 不启用**；用 k=8 | `runs/prod_routing_4b_b1_k4_20261122.json` |
+| 35B-A3B TP=2 gateway（free MTP + tool DraftSlice） | DraftSlice 池 4 个结构化请求后挂住；`No available shared memory broadcast block` 60s；baseline built-in 199.6/191.5 tok/s/GPU 正常 | **35B-A3B 保持 built-in 单 profile；TP>1 MoE 的 DraftSlice 是 blocker** | `runs/routing/results_35b/GATEWAY_TP2_HANG.md` |
+
+### 1.1 已确认的正收益 cell
+
+| model | workload | batch | action | vs best built-in | 状态 |
+|---|---|---|---:|---:|---|
+| Qwen3.5-4B | tool_call | 1 | `draftslice_mtp` k=8 | **1.24×**（均值 1.286×） | **启用** |
+| Qwen3.5-4B | free | 1 | built-in MTP | 1.00 | built-in |
+| Qwen3.5-4B | json/regex | 1 | built-in MTP | 1.00 | built-in |
+| Qwen3.5-4B | all | 8 | built-in MTP | 1.00 | built-in |
+| Qwen3.5-35B-A3B | all | 8/32 | built-in MTP TP=2 | 1.00 | built-in；等 TP hang 修复 |
+| Qwen3.5-4B + DFlash | tool | 1/8 | — | B1 +10.5%、B8 −1.6% vs MTP | 不启用 |
 
 ---
 
@@ -76,6 +89,19 @@ grammar/shadow、row gather/scatter、Python 决策带来固定开销，行数�
 混合 batch 下，free 行仍要付 DraftSlice bookkeeping，structured 行又更慢，
 所以 `router` 从 per-case 的 0.90 掉到 0.767。池化本身（同 built-in profile）
 是中性偏正，说明 gateway 拓扑不是问题，**profile 选择才是**。
+
+### 2.5 4B B=1 与 DFlash（同轮）
+
+| 场景 | 最优动作 | vs best built-in | 备注 |
+|---|---|---:|---|
+| 4B B=1 tool | `draftslice_mtp` k=8 | **1.24×**（均值 1.286×） | 111.6 vs 90.2 tok/s；tau 7.67 vs 2.67–3.6 |
+| 4B B=1 free | built-in MTP | 1.00 | slice 0.906×；router 0.992× |
+| 4B B=1 json/regex | built-in MTP | 1.00 | slice 0.92–0.95× |
+| 4B B=1 tool，k=4 | 不启用 | 1.03× 均值 / 0.998× 中位 | k=8 更好 |
+| 4B B=1/8 tool，DFast | 不启用 | B1 +10.5%、B8 −1.6% vs MTP；B1 比 MTP slice 低 10.7% | 只赢 stock DFlash（1.24×） |
+
+4B 的 profile 表当前只需一条：`(4B, vllm, tool_call, batch=1, k=8,
+strict_slice)`。其余全部 built-in。35B-A3B 暂不启用任何 DraftSlice cell。
 
 ---
 
@@ -259,17 +285,25 @@ tau/validity/fallback）。Sinks：进程内 registry、JSONL 采样、Prometheu
 
 ---
 
-## 8. 未决实验（下一任务先做）
+## 8. 实验状态（本轮已完成）
 
-| ID | 实验 | 决定 |
-|---|---|---|
-| E1 | 35B-A3B TP=2：best single vs free-MTP + tool-DraftSlice gateway；50/50 与 20/80 free/tool | gateway 仅当 ≥1.05× 且 p99 ≤1.0× |
-| E2 | 4B B=1 全矩阵（mtp/slice/router，k=4/8） | 仅启用 B=1 tool cell（若 ≥1.05×） |
-| E3 | DFlash all-position vs built-in MTP，同轮，B=1/8 tool | DFlash 不胜 MTP 则不启用 |
+| ID | 实验 | 结果 | 决定 |
+|---|---|---|---|
+| E1 | 35B-A3B TP=2：best single vs free-MTP + tool-DraftSlice gateway | baseline built-in 199.6/191.5 tok/s/GPU；DraftSlice TP=2 池 4 请求后 hang | **35B-A3B 保持 built-in 单 profile**；gateway 阻塞 |
+| E2 | 4B B=1 全矩阵（k=4/8） | k=8 tool slice 1.24×（均值 1.286×）；k=4 tool 1.03×/中位 0.998×；free/json/regex <1 | **启用 4B B=1 tool k=8 cell**；其余 built-in |
+| E3 | DFlash all-position vs built-in MTP，B=1/8 tool | DFast vs DFlash 1.24×；vs MTP B1 +10.5%、B8 −1.6%；vs MTP slice B1 −10.7% | **4B tool 不启用 DFlash** |
 
-现有跨轮线索（需 E1/E2 同轮确认）：35B-A3B B=8 tool slice k=8 311 vs
-MTP k=4 240（1.29×）；B=32 tool slice k=1 730 vs MTP k=4 585（1.25×）；
-4B B=1 tool slice k=8 110 vs MTP k=4 93（1.18×）。
+下一任务优先实验：
+
+1. **TP>1 MoE hang 复现与定位**：单 `draftslice_mtp` TP=2 server + 单条 JSON 请求；
+   `py-spy dump` engine/workers；再用 `DRAFTSLICE_VLLM_SLICE=0` pass-through 对照。
+   重点检查 rank-local `full_logits` 是否在 TP all-gather 中造成死锁。
+2. **SGLang EAGLE/DFlash**：补 hook + B4 runner；默认 built-in。
+3. **Cost model MAPE**：B2 held-out；未校准前 scheduler 默认 full。
+4. **B=1 tool cell 的 p99/尾延迟**：当前只测吞吐；生产启用前补 p99 与多 seed。
+
+历史跨轮线索（仅方向性，不作为启用依据）：35B-A3B B=8 tool slice k=8 311 vs
+MTP k=4 240（1.29×）；B=32 tool slice k=1 730 vs MTP k=4 585（1.25×）。
 
 ---
 
@@ -279,8 +313,11 @@ MTP k=4 240（1.29×）；B=32 tool slice k=1 730 vs MTP k=4 585（1.25×）；
 - 不用“over stock DFlash”替代“over best built-in”的对照。
 - 不在固定池/偏斜 mix 下假设 gateway 会更好；4B k 路由 tool-heavy 是
   0.957×、p99 +36%。
+- **TP>1 MoE 不能宣称可用**：35B-A3B `draftslice_mtp` TP=2 在结构化请求上
+  hang；built-in MTP TP=2 正常。修复前 35B-A3B 保持 built-in。
+- 4B B=1 tool cell 只按 `(workload=tool, B=1, k=8)` 启用；不要把它推广到 B=8
+  或 JSON/regex。启用前补 p99 和多 seed。
 - 不把 `row_share` 写成 `head_share`；B=8 head share 很小。
-- 不在没有 E1 证据时为 35B-A3B 建 gateway。
 - 不做 learned per-cell controller；1–5 reps 会过拟合。
 - 引擎升级后 profile table 失效，必须重跑 gate。
 
