@@ -38,7 +38,24 @@ from ..plan.types import (
     ServingPoint,
     TokenSet,
 )
+from ..runtime.policy import PolicyDecision, RowFacts, StepFacts
+from ..runtime.trace import (
+    StepTrace,
+    TraceDecision,
+    TraceIdentity,
+    TraceRegistry,
+    TraceTiming,
+)
 from ..screen.base import Screener
+from .base import (
+    AdapterPolicy,
+    AdapterPolicyError,
+    TraceSampler,
+    filter_valid_sets,
+    load_adapter_policy,
+    make_registry,
+    trace_sample_from_env,
+)
 from .head_shard import HeadShard
 from .vllm_logits import build_draft_logits
 
@@ -61,6 +78,15 @@ _STATS: dict[str, Any] = {
     "last_contract": None,
     "tp_size": 1,
     "tp_rank": 0,
+    "profile_mode": "off",
+    "profile_table": "",
+    "profile_hash": "",
+    "cell_id": None,
+    "cell_hit": False,
+    "action": "builtin",
+    "row_share": 0.0,
+    "measured_head_share": None,
+    "trace_count": 0,
 }
 
 
@@ -112,12 +138,12 @@ def _emit_contract(
             kind=GuaranteeKind.FULL, universe="vocab", fallback_rule="built_in_method"
         )
         candidate_set = None
-        head_share = None
+        row_share = None
     else:
         execution = Execution(kind="slice_gemv", rows=valid)
         guarantee = Guarantee.exact_valid_set()
         candidate_set = valid
-        head_share = candidates / (rows * vocab_size) if rows and vocab_size else None
+        row_share = candidates / (rows * vocab_size) if rows and vocab_size else None
     contract = DraftContract(
         grammar_state_id=None,
         valid_set=valid,
@@ -129,7 +155,7 @@ def _emit_contract(
             k=k,
             source="draftslice_sglang",
             target_metric="throughput",
-            head_share=head_share,
+            row_share=row_share,
         ),
         fallback_reason=reason,
     )
@@ -151,6 +177,13 @@ class SglangConfig:
     screener_args: dict[str, Any] | None = None
     screener_artifact: str | None = None
     max_rows: int = 32_768
+    # Profile policy facts. SGLang does not expose the structured request type
+    # at the head hook, so the operator labels the deployment workload/model.
+    model: str = ""
+    method: str = "draftslice_eagle3"
+    workload: str = "structured"
+    quant: str = "auto"
+    graph: str = "eager"
 
     def __post_init__(self) -> None:
         if self.max_rows <= 0:
@@ -191,7 +224,148 @@ def config_from_env() -> SglangConfig:
         ).strip()
         or None,
         max_rows=max_rows,
+        model=os.environ.get("DRAFTSLICE_MODEL", "").strip(),
+        method=os.environ.get("DRAFTSLICE_METHOD", "").strip()
+        or "draftslice_eagle3",
+        workload=os.environ.get("DRAFTSLICE_WORKLOAD", "").strip() or "structured",
+        quant=os.environ.get("DRAFTSLICE_QUANT", "").strip() or "auto",
+        graph=os.environ.get("DRAFTSLICE_GRAPH", "").strip() or "eager",
     )
+
+
+_POLICY: AdapterPolicy | None = None
+_POLICY_READY = False
+_TRACES: TraceRegistry | None = None
+_TRACE_SAMPLER: TraceSampler | None = None
+
+
+def _trace_sink() -> tuple[TraceRegistry, TraceSampler]:
+    global _TRACES, _TRACE_SAMPLER
+    if _TRACES is None or _TRACE_SAMPLER is None:
+        try:
+            _TRACES = make_registry(256)
+            _TRACE_SAMPLER = TraceSampler(trace_sample_from_env())
+        except AdapterPolicyError as exc:
+            raise SglangIntegrationError(str(exc)) from exc
+    return _TRACES, _TRACE_SAMPLER
+
+
+def adapter_policy(config: SglangConfig) -> AdapterPolicy | None:
+    """Load the production policy once; a bad table/hash raises at install."""
+
+    global _POLICY, _POLICY_READY
+    if _POLICY_READY:
+        return _POLICY
+    _POLICY_READY = True
+    try:
+        _POLICY = load_adapter_policy(
+            "sglang", model=config.model or None, method=config.method
+        )
+    except AdapterPolicyError as exc:
+        raise SglangIntegrationError(str(exc)) from exc
+    if _POLICY is not None and _POLICY.uses_table:
+        _STATS["profile_mode"] = _POLICY.profile_mode
+        _STATS["profile_table"] = _POLICY.table_path
+        _STATS["profile_hash"] = _POLICY.table_hash
+    return _POLICY
+
+
+def _policy_hold(config: SglangConfig) -> Any | None:
+    """Reason to hold on the stock head for the whole run (observe/off)."""
+
+    policy = adapter_policy(config)
+    if policy is None:
+        return None
+    reason = policy.hold_reason
+    if reason is not None:
+        _STATS["profile_mode"] = policy.profile_mode
+        _STATS["action"] = "builtin"
+        _STATS["cell_hit"] = False
+        _STATS["cell_id"] = None
+    return reason
+
+
+def _decide_policy(
+    config: SglangConfig, state: dict[str, Any], candidates: list[Any], rows: int
+) -> PolicyDecision | None:
+    policy = adapter_policy(config)
+    if policy is None or policy.policy is None:
+        return None
+    workload = config.workload or "structured"
+    facts = StepFacts(
+        engine="sglang",
+        model=config.model or "<unset>",
+        method=config.method,
+        batch=int(state.get("batch", 1) or 1),
+        k=int(state.get("topk", 1) or 1),
+        tp=int(_STATS.get("tp_size", 1) or 1),
+        quant=config.quant,
+        graph=config.graph,
+        rows=tuple(
+            RowFacts(
+                workload=workload,
+                valid_size=0 if token_set is None else len(token_set),
+            )
+            for token_set in candidates[:rows]
+        ),
+        capabilities={"grammar": True, "graph": True},
+    )
+    decision = policy.policy.decide(facts)
+    _STATS["profile_mode"] = decision.profile_mode
+    _STATS["cell_id"] = decision.cell_id
+    _STATS["cell_hit"] = decision.cell_hit
+    _STATS["action"] = decision.action
+    traces, sampler = _trace_sink()
+    if sampler():
+        row_facts = facts.rows
+        candidates = sum(
+            row.valid_size
+            for row, hit in zip(row_facts, decision.row_mask, strict=True)
+            if hit
+        )
+        traces.add(
+            StepTrace(
+                identity=TraceIdentity(
+                    engine="sglang",
+                    model=config.model or "unknown",
+                    tp=int(_STATS.get("tp_size", 1) or 1),
+                    quant=config.quant,
+                    graph=config.graph,
+                    workload=config.workload or "structured",
+                    config_hash=str(_STATS.get("profile_hash", "")),
+                ),
+                decision=TraceDecision(
+                    mode=decision.mode,
+                    action=decision.action,
+                    profile_mode=decision.profile_mode,
+                    source="policy",
+                    k=int(state.get("topk", 1) or 1),
+                    cell_id=decision.cell_id,
+                    cell_hit=decision.cell_hit,
+                    reason=None if decision.executes_slice else decision.reason.value,
+                    candidates=candidates,
+                    rows=len(row_facts),
+                    row_share=min(
+                        1.0,
+                        float(candidates) / float(max(1, len(row_facts)) * max(1, rows)),
+                    ),
+                ),
+                timing=TraceTiming(),
+            )
+        )
+        _STATS["trace_count"] = traces.recorded
+    return decision
+
+
+def stats() -> dict[str, Any]:
+    """Copy of the integration counters plus the recent step traces."""
+
+    out = dict(_STATS)
+    out["fallback_reasons"] = dict(_STATS["fallback_reasons"])
+    out["recent_traces"] = (
+        [] if _TRACES is None else [t.to_dict() for t in _TRACES.recent(4)]
+    )
+    return out
 
 
 def _ensure_screener(config: SglangConfig) -> Screener | None:
@@ -344,6 +518,15 @@ def _patched_compute_lm_head(
     _STATS["step0_calls"] += 1
     _STATS["tp_size"] = int(getattr(lm_head, "tp_size", 1) or 1)
     _STATS["tp_rank"] = int(getattr(lm_head, "tp_rank", 0) or 0)
+    hold = _policy_hold(config)
+    if hold is not None:
+        # observe/off/disabled-only: stock head, no candidate work.
+        _STATS["fallback_calls"] += 1
+        _note_fallback(hold.value)
+        _emit_contract(mode="full", reason=hold.value)
+        return _ORIGINAL_LM_HEAD(
+            self, hidden_states, lm_head, embedding_bias, out=out
+        )
     weight = _sliceable_weight(lm_head)
     if weight is None:
         _STATS["fallback_calls"] += 1
@@ -398,6 +581,40 @@ def _patched_compute_lm_head(
         return _ORIGINAL_LM_HEAD(
             self, hidden_states, lm_head, embedding_bias, out=out
         )
+
+    policy_decision = _decide_policy(config, state, candidates, rows)
+    if policy_decision is not None:
+        if not policy_decision.executes_slice:
+            _STATS["fallback_calls"] += 1
+            reason = policy_decision.reason.value
+            _note_fallback(reason)
+            _emit_contract(
+                mode="full",
+                reason=reason,
+                valid_sets=candidates,
+                rows=rows,
+                vocab_size=kernel_vocab,
+            )
+            return _ORIGINAL_LM_HEAD(
+                self, hidden_states, lm_head, embedding_bias, out=out
+            )
+        if policy_decision.action not in ("slice", "mask"):
+            # SGLang currently slices block position 0; a mask_allpos cell is a
+            # DFlash/vLLM operating point.
+            _STATS["fallback_calls"] += 1
+            _note_fallback("capability_unsupported")
+            _emit_contract(mode="full", reason="capability_unsupported")
+            return _ORIGINAL_LM_HEAD(
+                self, hidden_states, lm_head, embedding_bias, out=out
+            )
+        candidates = filter_valid_sets(candidates, policy_decision.row_mask)
+        if not any(token_set is not None for token_set in candidates):
+            _STATS["fallback_calls"] += 1
+            _note_fallback("no_candidates")
+            _emit_contract(mode="full", reason="no_candidates")
+            return _ORIGINAL_LM_HEAD(
+                self, hidden_states, lm_head, embedding_bias, out=out
+            )
 
     # _compute_lm_head returns rank-local logits; SGLang gathers them later.
     # A TP rank therefore slices its own shard with local row ids and returns
@@ -493,6 +710,7 @@ def _patched_draft(self: Any, batch: Any, *args: Any, **kwargs: Any) -> Any:
             "step": 0,
             "config": config,
             "topk": int(getattr(self, "topk", 1)),
+            "batch": len(grammars),
             "sliced_calls": 0,
         }
         if grammars
@@ -511,6 +729,8 @@ def install() -> None:
     global _PATCHED, _ORIGINAL_DRAFT, _ORIGINAL_LM_HEAD
     if _PATCHED:
         return
+    # Fail at startup, not on the first request, when a table/hash is bad.
+    adapter_policy(config_from_env())
     try:
         from sglang.srt.layers.logits_processor import LogitsProcessor
         from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker

@@ -28,6 +28,7 @@ from typing import Any
 import numpy as np
 
 from ..plan.types import TokenSet
+from .base import classify_structured_workload
 from .vllm_grammar import _cached_valid_ids, count_valid_ids
 
 
@@ -73,6 +74,7 @@ class _ShadowEntry:
     req_id: str
     grammar: Any
     state_key: bytes = b""
+    workload: str = "structured"
     step_grammars: dict[int, Any] = field(default_factory=dict)
     step_keys: dict[int, bytes] = field(default_factory=dict)
 
@@ -94,9 +96,18 @@ class _ShadowEntry:
 class GrammarShadowRegistry:
     """Per-request xgrammar matchers advanced by sampled output tokens."""
 
-    def __init__(self, vllm_config: Any, *, max_ids: int) -> None:
+    def __init__(
+        self,
+        vllm_config: Any,
+        *,
+        max_ids: int,
+        workload_default: str = "structured",
+        workload_map: dict[str, str] | None = None,
+    ) -> None:
         self.vllm_config = vllm_config
         self.max_ids = max_ids
+        self.workload_default = workload_default
+        self.workload_map = dict(workload_map or {})
         self.vocab_size = int(vllm_config.model_config.get_vocab_size())
         self.backend: Any | None = None
         self.tokenizer: Any | None = None
@@ -179,6 +190,11 @@ class GrammarShadowRegistry:
                 grammar_spec,
                 stop_token_ids=set(stop_ids),
             )
+            workload = classify_structured_workload(
+                request_type,
+                mapping=self.workload_map,
+                default=self.workload_default,
+            )
             # The state cache is shared across requests. Tag it with the grammar
             # definition so two requests with the same token prefix but different
             # schemas cannot collide.
@@ -198,6 +214,7 @@ class GrammarShadowRegistry:
                 req_id=req_id,
                 grammar=grammar,
                 state_key=grammar_tag,
+                workload=workload,
                 reasoner=reasoner,
                 grammar_active=reasoner is None,
             )
@@ -241,6 +258,14 @@ class GrammarShadowRegistry:
 
     def has(self, req_index: int) -> bool:
         return int(req_index) in self.entries
+
+    def workload(self, req_index: int) -> str:
+        """Cell workload label for a request (``structured`` when unknown)."""
+
+        entry = self.entries.get(int(req_index))
+        if entry is None:
+            return "structured"
+        return entry.workload
 
     def clear_steps(self) -> None:
         for entry in self.entries.values():

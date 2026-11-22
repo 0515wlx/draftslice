@@ -33,7 +33,7 @@ def _strict() -> DraftContract:
         mode="strict",
         execution=Execution(kind="slice_gemv", rows=TokenSet([1, 5])),
         guarantee=Guarantee.exact_valid_set(),
-        serving=ServingPoint(k=4, source="draftslice_tp2", head_share=0.25),
+        serving=ServingPoint(k=4, source="draftslice_tp2", row_share=0.25),
     )
 
 
@@ -106,7 +106,7 @@ def test_calibrated_contract_round_trip() -> None:
         guarantee=Guarantee.calibrated(
             0.05, universe="valid", calibration_id="cal-1"
         ),
-        serving=ServingPoint(k=1, source="draftslice+static", head_share=0.5),
+        serving=ServingPoint(k=1, source="draftslice+static", row_share=0.5),
     )
     assert contract_from_dict(contract_to_dict(contract)) == contract
 

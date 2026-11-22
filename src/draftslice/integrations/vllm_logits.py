@@ -6,6 +6,11 @@ fallback. Rows with an exact valid set are packed into a padded candidate matrix
 (one padded width bucket per kernel launch), the fused slice kernel gathers the
 weight rows and writes them directly into a full-vocabulary tensor with ``-inf``
 elsewhere, and rows without a strict set use the full head.
+
+Under tensor parallelism the adapter passes ``combine_logits`` (sum the partial
+per-rank tensors) and ``plan_agreement`` (union the full-head row set across
+ranks). Both are required for correctness: the engine samples on every rank, so
+replicas whose logits or row plans differ deadlock the next TP collective.
 """
 
 from __future__ import annotations
@@ -32,6 +37,21 @@ class VllmLogitsError(RuntimeError):
     """Raised when draft logits cannot be constructed."""
 
 
+#: Agree the set of rows that need the engine's full head across TP ranks.
+#: Signature: ``(rows, local_full_rows, device) -> agreed_full_rows``. It must
+#: run one collective so every rank sees the same row set: the engine's full
+#: head gathers logits over a row subset, and a rank-local subset deadlocks it.
+PlanAgreement = Callable[[int, "Sequence[int]", Any], list[int]]
+
+#: Max-reduce this rank's partial ``[rows, vocab]`` logits across TP ranks.
+#: Each column is scored by exactly one rank, so the max is the complete
+#: distribution on every rank (``-inf`` is the identity; a sum would absorb
+#: finite values into the unowned ``-inf`` columns). The engine samples (and
+#: advances the grammar shadow) on every rank, so a rank-local tensor would let
+#: the ranks diverge.
+LogitsCombine = Callable[[Any], Any]
+
+
 @dataclass(frozen=True, slots=True)
 class DraftSliceLogitsStats:
     rows: int
@@ -40,9 +60,16 @@ class DraftSliceLogitsStats:
     candidate_total: int
     distinct_sets: int
     # Rows that kept the full head because at least one rank owns no token of
-    # the valid set. The decision is identical on every rank (required by the
-    # TP logits all-gather) and the result is masked to V.
+    # the valid set. Only used on the legacy (non-combining) path; with
+    # ``combine_logits`` such rows are scored by their owning rank and summed.
     masked_full_rows: int = 0
+    # Number of rows whose full-head decision was agreed with the other TP
+    # ranks. Zero on TP=1 and on the legacy path.
+    agreed_full_rows: int = 0
+    # Whether the returned logits are the complete distribution on this rank.
+    replicated: bool = True
+    # Whether the partial rows were summed across TP ranks for this call.
+    combined: bool = False
 
     def to_dict(self) -> dict[str, int]:
         return {
@@ -52,6 +79,9 @@ class DraftSliceLogitsStats:
             "candidate_total": self.candidate_total,
             "distinct_sets": self.distinct_sets,
             "masked_full_rows": self.masked_full_rows,
+            "agreed_full_rows": self.agreed_full_rows,
+            "replicated": self.replicated,
+            "combined": self.combined,
         }
 
 
@@ -328,6 +358,8 @@ def build_draft_logits(
     soft_cap: float | None = None,
     deterministic: bool = False,
     shard: HeadShard | None = None,
+    plan_agreement: PlanAgreement | None = None,
+    combine_logits: LogitsCombine | None = None,
 ) -> tuple[Any, DraftSliceLogitsStats]:
     """Build ``[batch, vocab]`` logits with sliced rows and ``-inf`` elsewhere.
 
@@ -336,9 +368,19 @@ def build_draft_logits(
     to the full head, because slicing it is not a strict-mode win.
 
     With ``shard`` set (TP>1), global token ids are mapped to this rank's local
-    weight rows, scored there, and scattered back to global columns. Rows whose
-    valid set has no token on this rank use ``full_logits`` masked to V, so a
-    rank-local fallback cannot propose a grammar-invalid token.
+    weight rows, scored there, and scattered back to global columns.
+
+    Two callbacks make the TP path correct; both are optional so TP=1 and the
+    unit tests keep the rank-local behaviour:
+
+    * ``combine_logits`` max-reduces the partial rows across TP ranks. Without it each
+      rank only has finite values on its own vocabulary shard, so the ranks
+      sample different draft tokens, fork the grammar shadow differently, and
+      later disagree on which rows need the full head — which deadlocks the
+      engine's TP logits all-gather.
+    * ``plan_agreement`` unions the full-head row set across ranks before the
+      collective. It is the safety net for any residual per-rank difference in
+      the grammar state.
     """
 
     if torch is None:
@@ -377,6 +419,8 @@ def build_draft_logits(
 
     global_ids: dict[int, tuple[int, ...]] = {}
     masked_full_rows: set[int] = set()
+    tp_size = 1 if shard is None else int(getattr(shard, "tp_size", 1) or 1)
+    combine = combine_logits if tp_size > 1 else None
     if shard is not None:
         rank_sets = restrict_to_rank(valid_sets, shard, max_rows=max_rows)
         effective: list[TokenSet | None] = []
@@ -386,21 +430,52 @@ def build_draft_logits(
                 continue
             effective.append(rank_set.local)
             global_ids[id(rank_set.local)] = rank_set.global_ids
-        # A full-head fallback invokes the engine's TP logits all-gather, which
-        # is collective: every rank must enter it for exactly the same rows.
-        # Decide from all ranks' id ranges, not from this rank's local subset.
-        for row, global_set in enumerate(valid_sets):
-            if (
-                row in det_skip
-                or global_set is None
-                or global_set.is_empty
-                or len(global_set) > max_rows
-            ):
-                continue
-            if any(count == 0 for count in shard.local_counts(global_set)):
-                masked_full_rows.add(row)
+        if combine is None:
+            # Legacy (non-combining) TP path: a rank that owns no token of a row
+            # cannot produce that row's distribution, so it takes the engine's
+            # full head. The decision uses all ranks' id ranges, not this rank's
+            # local subset, so it is identical on every rank.
+            for row, global_set in enumerate(valid_sets):
+                if (
+                    row in det_skip
+                    or global_set is None
+                    or global_set.is_empty
+                    or len(global_set) > max_rows
+                ):
+                    continue
+                if any(count == 0 for count in shard.local_counts(global_set)):
+                    masked_full_rows.add(row)
     else:
         effective = list(valid_sets)
+
+    # Rows that must use the engine's full head. With ``combine`` a rank that
+    # owns no candidate simply contributes ``-inf`` and the owning ranks fill
+    # the columns, so only genuinely unusable plans land here.
+    local_full: list[int] = []
+    for row, global_set in enumerate(valid_sets):
+        if row in det_skip:
+            continue
+        if global_set is None or global_set.is_empty or len(global_set) > max_rows:
+            local_full.append(row)
+            continue
+        if row in masked_full_rows:
+            local_full.append(row)
+            continue
+        local_set = effective[row]
+        if local_set is not None and local_set.ids and local_set.ids[-1] >= local_vocab:
+            # Defensive: ``restrict_to_rank`` filters local rows, so this only
+            # guards a future mapping change. Treat it as a full-head row on
+            # every rank instead of slicing an out-of-range row.
+            local_full.append(row)
+    agreed_full_rows = 0
+    if plan_agreement is not None and tp_size > 1:
+        full_rows = plan_agreement(
+            int(hidden_states.shape[0]), tuple(local_full), hidden_states.device
+        )
+        agreed_full_rows = len(full_rows)
+    else:
+        full_rows = local_full
+    full_row_set = set(full_rows)
 
     out = torch.full(
         (hidden_states.shape[0], vocab_size),
@@ -415,26 +490,23 @@ def build_draft_logits(
     # grouped gather+GEMM path and scatter through the global-id map below.
     fused = getattr(kernel, "supports_rows_into", False) and shard is None
     fused_max_width = _fused_max_width(max_rows) if fused else 0
-    full_rows: list[int] = []
     groups: dict[int, tuple[Any, list[int]]] = {}
     buckets: dict[int, list[tuple[int, TokenSet]]] = {}
     distinct_ids: set[int] = set()
     for row, token_set in enumerate(effective):
-        if row in det_skip:
+        if row in det_skip or row in full_row_set:
             continue
-        if shard is not None and row in masked_full_rows:
-            # Keep the collective balanced even on ranks that own local rows.
-            full_rows.append(row)
+        if token_set is None or not token_set.ids:
+            # This rank owns no candidate column: the owning ranks contribute
+            # the row and ``combine_logits`` joins them.
             continue
-        if token_set is None or not token_set.ids or len(token_set) > max_rows:
-            full_rows.append(row)
+        if len(token_set) > max_rows:
             continue
         ids = token_set.ids
         # Bitmask decoding already clips to ``vocab_size`` and returns sorted
         # ids, so the old per-token Python scan was pure overhead on the hot
         # path (up to 32k iterations per row).
         if ids[-1] >= local_vocab:
-            full_rows.append(row)
             continue
         distinct_ids.add(id(token_set))
         if fused and len(token_set) <= fused_max_width:
@@ -524,9 +596,13 @@ def build_draft_logits(
         # the row a one-hot constrained distribution.
         out[det_index, det_token] = 0.0
 
+    full_values = None
+    full_row_index = None
     if full_rows:
-        row_index = _upload(np.asarray(full_rows, dtype=np.int64), hidden_states.device)
-        values = full_logits(hidden_states.index_select(0, row_index))
+        full_row_index = _upload(
+            np.asarray(full_rows, dtype=np.int64), hidden_states.device
+        )
+        values = full_logits(hidden_states.index_select(0, full_row_index))
         if values is None:
             raise VllmLogitsError("full_logits returned None")
         if values.shape[0] != len(full_rows) or values.shape[1] < vocab_size:
@@ -552,7 +628,18 @@ def build_draft_logits(
                 kept = values[index, columns]
                 values[index] = float("-inf")
                 values[index, columns] = kept
-        out[row_index] = values[:, :vocab_size].float()
+        full_values = values[:, :vocab_size].float()
+        out[full_row_index] = full_values
+
+    if combine is not None:
+        # Full-head rows are already replicated on every rank. Blank the local
+        # copies so the reduce cannot combine two different masks, then restore
+        # the replicated values afterwards.
+        if full_row_index is not None:
+            out[full_row_index] = float("-inf")
+        out = combine(out)
+        if full_row_index is not None:
+            out[full_row_index] = full_values
 
     distinct_sets = len(distinct_ids)
     return out, DraftSliceLogitsStats(
@@ -562,11 +649,16 @@ def build_draft_logits(
         candidate_total=candidate_total,
         distinct_sets=distinct_sets,
         masked_full_rows=len(masked_full_rows),
+        agreed_full_rows=agreed_full_rows,
+        replicated=combine is not None or tp_size == 1,
+        combined=combine is not None,
     )
 
 
 __all__ = [
     "DraftSliceLogitsStats",
+    "LogitsCombine",
+    "PlanAgreement",
     "VllmLogitsError",
     "build_draft_logits",
     "mask_logits_to_valid",

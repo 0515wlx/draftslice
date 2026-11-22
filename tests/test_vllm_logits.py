@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import threading
+from typing import Any
+
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -320,6 +323,192 @@ def test_sharded_deterministic_rows_use_global_ids() -> None:
         expected = torch.full((16,), float("-inf"))
         expected[token] = 0.0
         torch.testing.assert_close(combined[row], expected)
+
+
+class _FakeTpGroup:
+    """Two-rank simulator for the engine's all-gather callbacks.
+
+    Both ranks build concurrently, so ``plan_agreement`` and ``combine_logits``
+    can wait for the peer exactly like the real collective. ``full_rows_seen``
+    records the row set each rank passed to the engine's full head: a mismatch
+    is the production deadlock this test guards against.
+    """
+
+    def __init__(self, size: int = 2) -> None:
+        self.size = size
+        self.barrier = threading.Barrier(size)
+        self.flags: list[Any] = []
+        self.logits: list[Any] = []
+        self.full_rows_seen: list[list[int]] = []
+
+    def callbacks(self, rank: int) -> tuple[Any, Any]:
+        def plan_agreement(rows: int, full_rows: Any, device: Any) -> list[int]:
+            flags = torch.zeros(rows, dtype=torch.int32, device=device)
+            local = list(full_rows)
+            if local:
+                flags[torch.as_tensor(local, dtype=torch.int64, device=device)] = 1
+            self.flags.append(flags.detach().cpu())
+            self.barrier.wait()
+            agreed = torch.stack(self.flags).amax(dim=0)
+            return agreed.nonzero(as_tuple=False).flatten().tolist()
+
+        def combine_logits(logits: Any) -> Any:
+            self.logits.append(logits.detach().cpu().clone())
+            self.barrier.wait()
+            return torch.stack(self.logits).amax(dim=0)
+
+        return plan_agreement, combine_logits
+
+
+def test_tp_combine_replicates_logits_and_agrees_full_rows() -> None:
+    """Divergent per-rank grammar states must not call the full head with
+    different row sets, and the returned logits must be complete on each rank.
+
+    A rank-local tensor made every rank sample a different draft token, which
+    forked the grammar shadow differently and, one step later, produced the
+    deadlocking ``full_rows`` sets this test reproduces (TP0 had row 1, TP1
+    did not).
+    """
+
+    torch.manual_seed(11)
+    hidden = torch.randn(4, 4)
+    weight = torch.randn(16, 4)
+    rank_sets = [
+        [None, None, TokenSet([1, 3, 9, 14]), TokenSet([10, 11])],
+        [None, TokenSet([2]), TokenSet([1, 3, 9, 14]), TokenSet([10, 11])],
+    ]
+    tp = _FakeTpGroup(2)
+    outs: list[Any] = [None, None]
+    stats: list[Any] = [None, None]
+
+    def build(rank: int) -> None:
+        agreement, combine = tp.callbacks(rank)
+
+        def full_logits(rows: Any) -> Any:
+            # The engine's full head gathers over this row count; equal counts
+            # on every rank are what keeps the collective from deadlocking.
+            tp.full_rows_seen.append(int(rows.shape[0]))
+            return rows @ weight.T
+
+        outs[rank], stats[rank] = build_draft_logits(
+            hidden,
+            weight[rank * 8 : (rank + 1) * 8],
+            rank_sets[rank],
+            vocab_size=16,
+            full_logits=full_logits,
+            kernel=TorchGatherKernel(),
+            shard=_rank_shard(rank),
+            plan_agreement=agreement,
+            combine_logits=combine,
+        )
+
+    threads = [threading.Thread(target=build, args=(rank,)) for rank in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    # Both ranks asked the engine's full head for the same rows: row 0 has no
+    # set on either rank, and row 1 only on rank 1, so the agreement makes it a
+    # full-head row everywhere.
+    assert tp.full_rows_seen == [2, 2]
+    for rank in range(2):
+        assert stats[rank].agreed_full_rows == 2
+        assert stats[rank].full_rows == 2
+        assert stats[rank].combined
+        assert stats[rank].replicated
+
+    full = hidden @ weight.T
+    for rank in range(2):
+        out = outs[rank]
+        assert out.shape == (4, 16)
+        # A row with no grammar state keeps the replicated full head.
+        torch.testing.assert_close(out[0], full[0])
+        torch.testing.assert_close(out[1], full[1])
+        for row, valid in ((2, TokenSet([1, 3, 9, 14])), (3, TokenSet([10, 11]))):
+            expected = torch.full((16,), float("-inf"))
+            expected[list(valid.ids)] = full[row, list(valid.ids)]
+            torch.testing.assert_close(out[row], expected)
+        # Replicas are identical, so greedy draft sampling cannot diverge.
+        torch.testing.assert_close(out, outs[0])
+
+
+def test_tp_combine_skips_full_head_for_single_rank_rows() -> None:
+    """A row whose valid set lives on one rank is scored by that rank and summed
+    instead of forcing the (collective) full head on both."""
+
+    torch.manual_seed(13)
+    hidden = torch.randn(3, 4)
+    weight = torch.randn(16, 4)
+    valid_sets = [TokenSet([1]), TokenSet([9]), TokenSet([2, 10])]
+    tp = _FakeTpGroup(2)
+    outs: list[Any] = [None, None]
+    stats: list[Any] = [None, None]
+
+    def build(rank: int) -> None:
+        agreement, combine = tp.callbacks(rank)
+        outs[rank], stats[rank] = build_draft_logits(
+            hidden,
+            weight[rank * 8 : (rank + 1) * 8],
+            valid_sets,
+            vocab_size=16,
+            full_logits=lambda rows: rows @ weight.T,
+            kernel=TorchGatherKernel(),
+            shard=_rank_shard(rank),
+            plan_agreement=agreement,
+            combine_logits=combine,
+        )
+
+    threads = [threading.Thread(target=build, args=(rank,)) for rank in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    full = hidden @ weight.T
+    for rank in range(2):
+        out = outs[rank]
+        assert stats[rank].full_rows == 0
+        assert stats[rank].masked_full_rows == 0
+        for row, valid in enumerate(valid_sets):
+            expected = torch.full((16,), float("-inf"))
+            expected[list(valid.ids)] = full[row, list(valid.ids)]
+            torch.testing.assert_close(out[row], expected)
+        torch.testing.assert_close(out, outs[0])
+
+
+def test_tp_combine_counts_full_rows_once() -> None:
+    """The replicated full-head rows must not be combined twice."""
+
+    torch.manual_seed(17)
+    hidden = torch.randn(2, 4)
+    weight = torch.randn(16, 4)
+    tp = _FakeTpGroup(2)
+    outs: list[Any] = [None, None]
+
+    def build(rank: int) -> None:
+        agreement, combine = tp.callbacks(rank)
+        outs[rank], _ = build_draft_logits(
+            hidden,
+            weight[rank * 8 : (rank + 1) * 8],
+            [None, None],
+            vocab_size=16,
+            full_logits=lambda rows: rows @ weight.T,
+            kernel=TorchGatherKernel(),
+            shard=_rank_shard(rank),
+            plan_agreement=agreement,
+            combine_logits=combine,
+        )
+
+    threads = [threading.Thread(target=build, args=(rank,)) for rank in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    full = hidden @ weight.T
+    torch.testing.assert_close(outs[0], full)
+    torch.testing.assert_close(outs[1], full)
 
 
 def test_validation_errors() -> None:

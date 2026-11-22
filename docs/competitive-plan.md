@@ -16,12 +16,14 @@ adapter-level free-form router is implemented and recovers the free-form
 regression; the fused DFlash all-position mask wins at B=1 and is neutral at
 B=8, but only within the DFlash family; a static free-form screener is a
 measured negative. TP>1, quantized heads, and FULL-graph step-0 masking are
-code-complete and unit-tested; real-engine gates remain per cell, and a
-2026-11-22 35B-A3B TP=2 `draftslice_mtp` run hung while built-in MTP TP=2 was
-healthy, so MoE TP>1 is gated. The 4B/B8 routing experiment found that a blanket
-structured slice is 0.767× on a mixed workload, so the production default is
-built-in and DraftSlice is profile-gated. Results are in the local `runs/`
-workspace.
+code-complete and unit-tested; real-engine gates remain per cell. A 2026-11-22
+35B-A3B TP=2 `draftslice_mtp` run hung while built-in MTP TP=2 was healthy; the
+cause was rank-local sliced logits making the replicas disagree on the full-head
+row set, and it is fixed (replicated logits + row-set agreement, two-rank
+regression test). MoE TP>1 is still gated until a same-run gate passes. The 4B/B8
+routing experiment found that a blanket structured slice is 0.767× on a mixed
+workload, so the production default is built-in and DraftSlice is
+profile-gated. Results are in the local `runs/` workspace.
 
 Related documents:
 
@@ -162,7 +164,9 @@ What is still missing:
 - server-level TTFT/ITL/cost and head-share decomposition;
 - a tau/latency Pareto that allows a lower `tau` when the server metric improves;
 - TP>1, quantized, and CUDA-graph operating points: code-complete and
-  unit-tested in the working tree; real-engine gates remain per profile cell;
+  unit-tested in the working tree; TP>1 replicates sliced logits and agrees the
+  full-head row set across ranks (the old hang is fixed), but no TP>1 cell is
+  enabled until its same-run gate passes;
 - a measured profile table: 4B/B8 blanket structured slice is a regression
   (0.767× mixed workload), so built-in is the default;
 - an SGLang B4 runner;

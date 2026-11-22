@@ -45,17 +45,21 @@ Completed:
   `draftslice_dflash`; grammar bridge; worker-side xgrammar shadow advanced by
   the verified tokens; per-position forks for `spec_tokens>1`; draft block
   position 0 slicing; full-head fallbacks. TP>1 slices each rank's contiguous
-  vocabulary shard and scatters the result back to global token-id columns;
-  ranks with no local candidate use the full head masked to V. Quantized
-  fp8/int8 heads dequantize candidate rows; unsupported scale layouts fall back
-  to a full head masked to V. FULL decode graphs refresh a static packed bitmask
-  before replay and use `mask`/full for step≥1; local-argmax reduction uses a
-  sliced `get_draft_top_tokens` override. Every decision emits a `DraftContract`
-  with the fail-closed reason. These paths are code-complete and unit-tested;
-  real-engine gates are tracked per profile cell. A 2026-11-22 35B-A3B TP=2
-  gateway run hung in `draftslice_mtp` after 4 structured requests while the
-  built-in MTP TP=2 pool was healthy; MoE TP>1 remains gated until that hang is
-  fixed.
+  vocabulary shard, scatters the result back to global token-id columns, then
+  max-reduces the partial logits across ranks so every rank has the same
+  distribution. The engine samples and advances the grammar shadow on every
+  rank, so rank-local logits would let the replicas diverge and deadlock a later
+  TP all-gather; `plan_agreement` also unions the full-head row set before the
+  collective. Quantized fp8/int8 heads dequantize candidate rows; unsupported
+  scale layouts fall back to a full head masked to V. FULL decode graphs
+  refresh a static packed bitmask before replay and use `mask`/full for step≥1;
+  local-argmax reduction uses a sliced `get_draft_top_tokens` override. Every
+  decision emits a `DraftContract` with the fail-closed reason. These paths are code-complete and unit-tested;
+  real-engine gates are tracked per profile cell. The 2026-11-22 35B-A3B TP=2
+  hang was a rank-local sliced-logits divergence (different `full_rows` per rank
+  in the engine logits all-gather); it is fixed and covered by a two-rank
+  collective test. MoE TP>1 still needs a same-run positive gate before any cell
+  is enabled.
 - M5 baseline and calibration core: shared policy interface plus full/static/SVD/
   trained low-rank/group/router/oracle and CFHead/FlashHead/VocabTrim reference
   policies; vocabulary partition, split-conformal calibration, artifact bundle
@@ -1650,8 +1654,10 @@ What remains is operational, not a state-timing blocker:
   recorded reason. True per-row slicing inside the graph would require a D2H sync
   for step≥1 states, so it is deliberately not attempted.
 - **TP/quantized heads:** TP>1 slices per-rank shards (vLLM) or local rows
-  (SGLang, gathered by the engine afterwards); quantized heads dequantize
-  candidate rows. Both paths emit a contract and a fallback reason.
+  (SGLang, gathered by the engine afterwards); the vLLM path max-reduces the
+  partial logits and agrees the full-head row set across ranks, because the
+  engine samples on every rank. Quantized heads dequantize candidate rows. Both
+  paths emit a contract and a fallback reason.
 - **Routing:** free-form rows and some structured workloads regress if slicing
   is enabled globally, so the production default is built-in and DraftSlice is
   enabled only by a measured profile cell. The 4B/B8 routing experiment found

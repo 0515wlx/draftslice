@@ -442,3 +442,98 @@ def test_block_allpos_respects_batch_gate(monkeypatch) -> None:
         is None
     )
     assert speculator._draftslice_stats.block_allpos_fallbacks == 1
+
+
+def test_policy_observe_hold_returns_builtin_logits(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    import torch
+
+    from draftslice.integrations import vllm as integration
+
+    monkeypatch.setenv("DRAFTSLICE_VLLM_SLICE", "1")
+
+    class Base:
+        def __init__(self) -> None:
+            self.vllm_config = SimpleNamespace()
+
+        def compute_draft_logits(self, hidden_states, spec_step_idx):
+            return torch.arange(
+                hidden_states.shape[0] * 16, dtype=torch.float32
+            ).reshape(hidden_states.shape[0], 16)
+
+    class Speculator(integration.DraftSliceSpeculatorMixin, Base):
+        pass
+
+    speculator = Speculator()
+    speculator._draftslice_policy_hold = "mode_observe"
+    logits = speculator.compute_draft_logits(torch.randn(2, 4), 0)
+    # Byte-identical to the built-in path, with the observe reason recorded.
+    assert logits.tolist() == Base().compute_draft_logits(torch.zeros(2, 4), 0).tolist()
+    assert speculator._draftslice_stats.fallback_reasons["mode_observe"] == 1
+    assert speculator._draftslice_stats.last_contract["mode"] == "full"
+
+
+def test_policy_enforce_masks_only_hitting_rows(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    from draftslice.integrations import vllm as integration
+    from draftslice.plan import TokenSet
+    from draftslice.runtime.policy import ProfilePolicy
+    from draftslice.runtime.profile import ProfitCell, build_table
+
+    monkeypatch.setenv("DRAFTSLICE_VLLM_SLICE", "1")
+
+    class Base:
+        def __init__(self) -> None:
+            self.vllm_config = SimpleNamespace(
+                model_config=SimpleNamespace(
+                    model="/models/Qwen3.5-4B",
+                    dtype=SimpleNamespace(name="bfloat16"),
+                    quantization=None,
+                ),
+                speculative_config=SimpleNamespace(method="draftslice_mtp"),
+                parallel_config=SimpleNamespace(tensor_parallel_size=1),
+            )
+
+    class Speculator(integration.DraftSliceSpeculatorMixin, Base):
+        pass
+
+    cell = ProfitCell(
+        model="Qwen3.5-4B",
+        engine="vllm",
+        method="draftslice_mtp",
+        workload="tool_call",
+        batch_bucket="2-8",
+        k=8,
+        tp=1,
+        quant="bf16",
+        graph="eager",
+        valid_bucket="65-512",
+        action="strict_slice",
+        expected_gain=1.24,
+        measured_p99_ratio=1.02,
+        manifest_id="b1",
+        enabled=True,
+    )
+    policy = ProfilePolicy(
+        build_table([cell], table_id="t"),
+        profile_mode="enforce",
+        engine="vllm",
+        model="Qwen3.5-4B",
+        method="draftslice_mtp",
+    )
+    speculator = Speculator()
+    speculator._draftslice_stats = integration.DraftSliceVllmStats()
+    speculator._draftslice_adapter_policy = integration.AdapterPolicy(
+        policy=policy, profile_mode="enforce", table_hash="sha256:x"
+    )
+    speculator.num_speculative_steps = 8
+    speculator._draftslice_row_workloads = ["tool_call", "free"]
+
+    decision = speculator._decide_policy([TokenSet(range(200)), None])
+    assert decision is not None and decision.executes_slice
+    assert decision.row_mask == (True, False)
+    assert speculator._draftslice_stats.cell_hit
+    assert speculator._draftslice_stats.action == "slice"
+    assert speculator._draftslice_stats.policy_slice_steps == 1

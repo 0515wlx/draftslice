@@ -437,13 +437,17 @@ Slicing is profile-gated: TP>1, quantized rows, FULL-graph step 0, local-argmax,
 and reasoning boundaries have concrete code paths, but each is enabled only by a
 cell whose same-run gate passes. The 4B/B8 experiment found a blanket structured
 slice is a regression (0.767× mixed workload), so B4 must report the built-in
-baseline and the profile decision, not just a slice-vs-stock ratio. A 35B-A3B
-TP=2 `draftslice_mtp` run hung after 4 structured requests while built-in MTP
-TP=2 was healthy; report TP>1 MoE as unsupported until that hang is fixed.
+baseline and the profile decision, not just a slice-vs-stock ratio. The
+2026-11-22 35B-A3B TP=2 hang (4 structured requests, rank-local `full_rows` in
+the engine all-gather) is fixed by max-reducing sliced logits across ranks and
+agreeing the full-head row set before the collective; report `tp_combined_calls`
+and `tp_agreed_full_rows` for TP>1 runs and keep TP>1 MoE cells disabled until
+their same-run gate passes.
 
 Report the speculator's `sliced_calls`, `fallback_calls`, `sliced_rows`,
-`full_rows`, `slice_disabled_calls`, `block_step0_rows`, and `mask_stride`
-(`DRAFTSLICE_VLLM_DEBUG=1`) alongside tau and the server metrics. A strict claim
+`full_rows`, `slice_disabled_calls`, `block_step0_rows`, `mask_stride`,
+`tp_combined_calls`, and `tp_agreed_full_rows` (`DRAFTSLICE_VLLM_DEBUG=1`)
+alongside tau and the server metrics. A strict claim
 needs greedy equality and 100% output validity. A lower `tau` is not
 automatically a regression: it is accepted when the server metric improves, and
 rejected when it does not. A head-only speedup is not an end-to-end claim; report

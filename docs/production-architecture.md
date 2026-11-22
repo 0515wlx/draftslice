@@ -28,7 +28,7 @@ Status: 2026-11-22. 本文是**唯一的生产架构基线**，替换此前的 v
 | static free-form screener 16k | 0.49×，tau 2.60→1.34 | **拒绝**；calibrated 只用于内存/覆盖，不作为 latency 路径 | closeout 记录 |
 | DFlash all-position “1.28×” | 同轮 DFast vs stock DFlash 1.24×；但 vs built-in MTP：B1 +10.5%、B8 −1.6%；vs DraftSlice MTP B1 −10.7% | **4B tool 不启用 DFlash**；MTP slice k=8 更好 | `runs/prod_dflash_ds_20261122.json`、`runs/prod_dflash_mtp_20261122.json` |
 | 4B B=1 tool，k=4 strict slice | 均值 1.033×、中位 0.998×；k=8 是 1.286×/1.242× | **k=4 不启用**；用 k=8 | `runs/prod_routing_4b_b1_k4_20261122.json` |
-| 35B-A3B TP=2 gateway（free MTP + tool DraftSlice） | DraftSlice 池 4 个结构化请求后挂住；`No available shared memory broadcast block` 60s；baseline built-in 199.6/191.5 tok/s/GPU 正常 | **35B-A3B 保持 built-in 单 profile；TP>1 MoE 的 DraftSlice 是 blocker** | `runs/routing/results_35b/GATEWAY_TP2_HANG.md` |
+| 35B-A3B TP=2 gateway（free MTP + tool DraftSlice） | 首轮：DraftSlice 池 4 个结构化请求后挂住（rank-local sliced logits 导致每 rank `full_rows` 不同，TP all-gather 死锁）。修复后同轮重跑：balanced 1.091×、tool-heavy 1.021×，validity 1.0、0 error | **hang 已修复；gateway 仍不建（偏斜 mix 未过 1.05×）；35B-A3B 保持 built-in 单 profile** | `runs/routing/results_35b/TP2_FIX_20261122.md`、`runs/routing/results_35b_fixed/` |
 
 ### 1.1 已确认的正收益 cell
 
@@ -259,7 +259,7 @@ alarm_fallback_rate = 0.05
 | 拓扑 | 使用条件 | 当前状态 |
 |---|---|---|
 | T1 单 profile | enabled cells 共享 `(method,k)`；默认 | 4B 最佳：2× built-in MTP |
-| T2 profile gateway | k/method 冲突且收益扛得住池化 | 4B 已证伪；35B-A3B 待 E1 |
+| T2 profile gateway | k/method 冲突且收益扛得住池化 | 4B 已证伪；35B-A3B E1 重跑 balanced 1.09× / tool-heavy 1.02×，不建 |
 | T3 多模型 gateway | 多模型/多 profile 统一入口 | 可选；必须有逐 profile 收益 |
 
 Gateway 若建：每池固定 `(engine,method,k,tp,quant,graph)`；精确 cell 路由；
@@ -289,15 +289,17 @@ tau/validity/fallback）。Sinks：进程内 registry、JSONL 采样、Prometheu
 
 | ID | 实验 | 结果 | 决定 |
 |---|---|---|---|
-| E1 | 35B-A3B TP=2：best single vs free-MTP + tool-DraftSlice gateway | baseline built-in 199.6/191.5 tok/s/GPU；DraftSlice TP=2 池 4 请求后 hang | **35B-A3B 保持 built-in 单 profile**；gateway 阻塞 |
+| E1 | 35B-A3B TP=2：best single vs free-MTP + tool-DraftSlice gateway | 首轮 hang（rank-local sliced logits）；修复后 0.5/0.5：202.7→221.1 tok/s/GPU（1.091×，ITL p99 −21%）；0.2/0.8：191.2→195.2（1.021×，TTFT p99 +13%）；validity 1.0、0 error | **hang 修复并回归测试；gateway 不建；35B-A3B 保持 built-in 单 profile** |
 | E2 | 4B B=1 全矩阵（k=4/8） | k=8 tool slice 1.24×（均值 1.286×）；k=4 tool 1.03×/中位 0.998×；free/json/regex <1 | **启用 4B B=1 tool k=8 cell**；其余 built-in |
 | E3 | DFlash all-position vs built-in MTP，B=1/8 tool | DFast vs DFlash 1.24×；vs MTP B1 +10.5%、B8 −1.6%；vs MTP slice B1 −10.7% | **4B tool 不启用 DFlash** |
+| E4 | P1 单 profile policy：空表 observe / 全 disabled enforce A/A；enabled cell 冒烟 | 4B TP=1，16 并发：baseline 1252.4 tok/s/GPU；empty+observe 1239.3（0.99×）；disabled+enforce 1217.8（0.97×）；B1 tool enforce 与 legacy slice 同为 tau 8.34、吞吐差 <2%；B=16 tool 0.54× | **observe/disabled A/A 通过；B≥8 不启用；B1 tool cell 需按生产 grammar 复跑 p99/多 seed** |
 
 下一任务优先实验：
 
-1. **TP>1 MoE hang 复现与定位**：单 `draftslice_mtp` TP=2 server + 单条 JSON 请求；
-   `py-spy dump` engine/workers；再用 `DRAFTSLICE_VLLM_SLICE=0` pass-through 对照。
-   重点检查 rank-local `full_logits` 是否在 TP all-gather 中造成死锁。
+1. ~~TP>1 MoE hang 复现与定位~~（已完成，2026-11-22）：根因是 rank-local sliced
+   logits；现在 TP>1 max-reduce 部分 logits，并在 `full_logits` 前统一 full-row
+   集合。回归测试为两 rank 并发 collective 测试；重跑数据见
+   `runs/routing/results_35b/TP2_FIX_20261122.md`。
 2. **SGLang EAGLE/DFlash**：补 hook + B4 runner；默认 built-in。
 3. **Cost model MAPE**：B2 held-out；未校准前 scheduler 默认 full。
 4. **B=1 tool cell 的 p99/尾延迟**：当前只测吞吐；生产启用前补 p99 与多 seed。
@@ -313,10 +315,15 @@ MTP k=4 240（1.29×）；B=32 tool slice k=1 730 vs MTP k=4 585（1.25×）。
 - 不用“over stock DFlash”替代“over best built-in”的对照。
 - 不在固定池/偏斜 mix 下假设 gateway 会更好；4B k 路由 tool-heavy 是
   0.957×、p99 +36%。
-- **TP>1 MoE 不能宣称可用**：35B-A3B `draftslice_mtp` TP=2 在结构化请求上
-  hang；built-in MTP TP=2 正常。修复前 35B-A3B 保持 built-in。
+- **TP>1 MoE 可运行，但还没有启用 cell**：35B-A3B `draftslice_mtp` TP=2 的
+  hang 已修复（replicated logits + full-row agreement，含回归测试）；但 E1 重跑
+  在 tool-heavy mix 只有 1.021×，35B-A3B 仍保持 built-in，不建 gateway。
 - 4B B=1 tool cell 只按 `(workload=tool, B=1, k=8)` 启用；不要把它推广到 B=8
-  或 JSON/regex。启用前补 p99 和多 seed。
+  或 JSON/regex。启用前补 p99 和多 seed。cell 对 grammar 形状敏感：E2 的
+  baseline tau 2.67–3.6 来自特定的 tool schema；routing bench 的 tool grammar
+  baseline tau≈6.0，同一切片只有中性收益。gate 必须固定生产 grammar 家族，
+  且 `valid_bucket` 要覆盖 grammar 生命周期内的所有桶（只开 `65-512` 会让
+  小 V 的后续 draft position 退回 full head，丢掉 acceptance）。
 - 不把 `row_share` 写成 `head_share`；B=8 head share 很小。
 - 不做 learned per-cell controller；1–5 reps 会过拟合。
 - 引擎升级后 profile table 失效，必须重跑 gate。

@@ -343,7 +343,10 @@ def contract_from_dict(value: Any) -> DraftContract:
                 source=str(serving_value.get("source", "builtin")),
                 expected_tau=serving_value.get("expected_tau"),
                 target_metric=str(serving_value.get("target_metric", "throughput")),
-                head_share=serving_value.get("head_share"),
+                row_share=serving_value.get(
+                    "row_share", serving_value.get("head_share")
+                ),
+                measured_head_share=serving_value.get("measured_head_share"),
             ),
             fallback_reason=value.get("fallback_reason"),
         )

@@ -36,6 +36,25 @@ from ..plan.types import (
     ServingPoint,
     TokenSet,
 )
+from ..runtime.policy import PolicyDecision, RowFacts, StepFacts
+from ..runtime.trace import (
+    StepTrace,
+    TraceDecision,
+    TraceIdentity,
+    TraceRegistry,
+    TraceTiming,
+)
+from .base import (
+    AdapterPolicy,
+    AdapterPolicyError,
+    TraceSampler,
+    filter_valid_sets,
+    load_adapter_policy,
+    make_registry,
+    trace_sample_from_env,
+    workload_config_from_env,
+)
+from .base import row_share as compute_row_share
 from .head_shard import HeadShard
 from .quant_dequant import (
     dequantize_rows,
@@ -109,8 +128,23 @@ class DraftSliceVllmStats:
     tp_size: int = 1
     tp_rank: int = 0
     tp_shard_rows: int = 0
+    tp_combined_calls: int = 0
+    tp_agreed_full_rows: int = 0
     quantized_head: bool = False
     quantized_rows: int = 0
+    # Production policy telemetry (P1). ``row_share`` is the sliced vocabulary
+    # fraction; ``measured_head_share`` is only set by a benchmark harness.
+    profile_mode: str = "off"
+    profile_table: str = ""
+    profile_hash: str = ""
+    cell_id: str | None = None
+    cell_hit: bool = False
+    action: str = "builtin"
+    policy_slice_steps: int = 0
+    policy_full_steps: int = 0
+    row_share: float = 0.0
+    measured_head_share: float | None = None
+    trace_count: int = 0
 
     def note_fallback(self, reason: str) -> None:
         """Record a fail-closed decision without flooding the error list."""
@@ -125,6 +159,11 @@ class DraftSliceVllmStats:
                 self.sliced_rows += stats.sliced_rows
                 self.full_rows += stats.full_rows
                 self.candidate_total += stats.candidate_total
+                self.tp_agreed_full_rows += int(
+                    getattr(stats, "agreed_full_rows", 0)
+                )
+                if getattr(stats, "combined", False):
+                    self.tp_combined_calls += 1
         else:
             self.fallback_calls += 1
 
@@ -174,6 +213,19 @@ class DraftSliceVllmStats:
             "tp_size": self.tp_size,
             "tp_rank": self.tp_rank,
             "tp_shard_rows": self.tp_shard_rows,
+            "tp_combined_calls": self.tp_combined_calls,
+            "tp_agreed_full_rows": self.tp_agreed_full_rows,
+            "profile_mode": self.profile_mode,
+            "profile_table": self.profile_table,
+            "profile_hash": self.profile_hash,
+            "cell_id": self.cell_id,
+            "cell_hit": self.cell_hit,
+            "action": self.action,
+            "policy_slice_steps": self.policy_slice_steps,
+            "policy_full_steps": self.policy_full_steps,
+            "row_share": self.row_share,
+            "measured_head_share": self.measured_head_share,
+            "trace_count": self.trace_count,
             "quantized_head": self.quantized_head,
             "quantized_rows": self.quantized_rows,
             "last_error": self.last_error,
@@ -181,8 +233,31 @@ class DraftSliceVllmStats:
         }
 
 
+def _debug_on() -> bool:
+    return os.environ.get("DRAFTSLICE_VLLM_DEBUG") == "1"
+
+
+def _tp_debug(message: str) -> None:
+    """Rank-tagged stderr trace of the TP collectives (debug builds only)."""
+
+    if not _debug_on():
+        return
+    import sys
+
+    print(f"[draftslice tp pid={os.getpid()}] {message}", file=sys.stderr, flush=True)
+
+
 def _enabled() -> bool:
     return os.environ.get("DRAFTSLICE_VLLM", "1") not in ("0", "false", "False")
+
+
+def _slicing_flag() -> bool | None:
+    """Tri-state of the legacy switch: True/False when set, None when unset."""
+
+    raw = os.environ.get("DRAFTSLICE_VLLM_SLICE")
+    if raw is None or raw == "":
+        return None
+    return raw in ("1", "true", "True")
 
 
 def _slicing_enabled() -> bool:
@@ -462,6 +537,13 @@ class DraftSliceSpeculatorMixin:
     _draftslice_shard: HeadShard | None = None
     _draftslice_head_key: tuple[Any, ...] | None = None
     _draftslice_head_cache: tuple[Any, HeadShard] | None = None
+    _draftslice_tp_plan: Any | None = None
+    _draftslice_adapter_policy: AdapterPolicy | None = None
+    _draftslice_policy_decision: PolicyDecision | None = None
+    _draftslice_row_workloads: list[str] | None = None
+    _draftslice_policy_hold: str | None = None
+    _draftslice_traces: TraceRegistry | None = None
+    _draftslice_trace_sampler: TraceSampler | None = None
     _draftslice_screener: Any | None = None
     _draftslice_screener_config: ScreenerConfig | None = None
     _draftslice_idx_mapping_np: np.ndarray | None = None
@@ -499,6 +581,48 @@ class DraftSliceSpeculatorMixin:
         self._draftslice_shard: HeadShard | None = None
         self._draftslice_head_key: tuple[Any, ...] | None = None
         self._draftslice_head_cache: tuple[Any, HeadShard] | None = None
+        self._draftslice_tp_plan: Any | None = None
+        self._draftslice_adapter_policy = None
+        self._draftslice_policy_decision = None
+        self._draftslice_row_workloads = None
+        try:
+            self._draftslice_adapter_policy = load_adapter_policy(
+                "vllm",
+                model=self._policy_model_name(),
+                method=self._policy_method_name(),
+            )
+        except AdapterPolicyError:
+            # A configured table with a bad hash/file is a hard error, never a
+            # silent built-in deployment.
+            raise
+        if self._draftslice_adapter_policy is not None and (
+            self._draftslice_adapter_policy.uses_table
+        ):
+            self._draftslice_stats.profile_mode = (
+                self._draftslice_adapter_policy.profile_mode
+            )
+            self._draftslice_stats.profile_table = (
+                self._draftslice_adapter_policy.table_path
+            )
+            self._draftslice_stats.profile_hash = (
+                self._draftslice_adapter_policy.table_hash
+            )
+            # The table replaces the blanket DRAFTSLICE_VLLM_SLICE switch. An
+            # explicitly disabled env flag still wins (emergency stop).
+            if _slicing_flag() is None and self._draftslice_enabled:
+                self._draftslice_slicing = (
+                    self._draftslice_allow_slicing
+                    and self._draftslice_adapter_policy.profile_mode != "off"
+                )
+        self._draftslice_policy_hold: str | None = None
+        self._draftslice_traces = make_registry()
+        self._draftslice_trace_sampler = TraceSampler(trace_sample_from_env())
+        self._draftslice_policy_identity = (
+            self._policy_model_name() or "unknown",
+            self._policy_method_name(),
+            self._policy_quant(),
+            self._tp_world_size(),
+        )
         self._draftslice_snapshot: GrammarSnapshot | None = None
         self._draftslice_input_batch: Any | None = None
         self._draftslice_idx_mapping: Any | None = None
@@ -569,7 +693,7 @@ class DraftSliceSpeculatorMixin:
             guarantee = Guarantee.full()
             execution = Execution(kind="full")
             candidate_set = None
-            head_share = None
+            row_share = None
         else:
             if screener_active:
                 config = self._draftslice_screener_config
@@ -585,7 +709,7 @@ class DraftSliceSpeculatorMixin:
             candidate_set = valid
             rows = int(getattr(logits_stats, "rows", 0))
             candidates = int(getattr(logits_stats, "candidate_total", 0))
-            head_share = candidates / (rows * vocab_size) if rows and vocab_size else None
+            row_share = candidates / (rows * vocab_size) if rows and vocab_size else None
             execution = Execution(
                 kind=execution_kind
                 or ("slice_gemm" if self._draftslice_shard is not None else "slice_gemv"),
@@ -607,7 +731,10 @@ class DraftSliceSpeculatorMixin:
                 k=int(getattr(self, "num_speculative_steps", 0) or 0),
                 source=source,
                 target_metric="throughput",
-                head_share=head_share,
+                row_share=row_share,
+                measured_head_share=getattr(
+                    self, "_draftslice_measured_head_share", None
+                ),
             ),
             fallback_reason=reason,
         )
@@ -626,6 +753,12 @@ class DraftSliceSpeculatorMixin:
     ) -> Any:
         """Fail closed to the full head and record the exact reason."""
 
+        if _debug_on():
+            _tp_debug(
+                f"fallback reason={reason!r} "
+                f"step={getattr(self, '_draftslice_step', 0)} "
+                f"rows={int(hidden_states.shape[0])}"
+            )
         self._draftslice_stats.record(sliced=False)
         self._emit_contract(mode="full", valid_sets=valid_sets, reason=reason)
         return base_compute(hidden_states, spec_step_idx)
@@ -737,6 +870,11 @@ class DraftSliceSpeculatorMixin:
 
     def reset_state(self) -> None:
         self._draftslice_stats = DraftSliceVllmStats()
+        adapter = self._draftslice_adapter_policy
+        if adapter is not None and adapter.uses_table:
+            self._draftslice_stats.profile_mode = adapter.profile_mode
+            self._draftslice_stats.profile_table = adapter.table_path
+            self._draftslice_stats.profile_hash = adapter.table_hash
         self._draftslice_shard = None
         self._draftslice_head_key = None
         self._draftslice_head_cache = None
@@ -753,6 +891,9 @@ class DraftSliceSpeculatorMixin:
         self._draftslice_req_by_state = {}
         self._draftslice_draft_step = None
         self._draftslice_route_full = False
+        self._draftslice_policy_decision = None
+        self._draftslice_policy_hold = None
+        self._draftslice_row_workloads = None
         if self._draftslice_shadow is not None:
             self._draftslice_shadow.clear()
         return super().reset_state()
@@ -760,7 +901,11 @@ class DraftSliceSpeculatorMixin:
     def register_shadow(self, req_index: int, sampling_params: Any) -> None:
         """Register a worker-side grammar shadow for a newly added request."""
 
-        if not self._draftslice_slicing or sampling_params is None:
+        if (
+            not self._draftslice_slicing
+            or not self._policy_allows_work()
+            or sampling_params is None
+        ):
             return
         if self._draftslice_shadow is None:
             try:
@@ -770,9 +915,12 @@ class DraftSliceSpeculatorMixin:
                     getattr(self, "vocab_size", 0)
                     or self.vllm_config.model_config.get_vocab_size()
                 )
+                workload_default, workload_map = workload_config_from_env()
                 self._draftslice_shadow = GrammarShadowRegistry(
                     self.vllm_config,
                     max_ids=_max_slice_rows(vocab_size),
+                    workload_default=workload_default,
+                    workload_map=workload_map,
                 )
             except Exception as exc:  # pragma: no cover - defensive
                 self._draftslice_stats.record_error(f"shadow init: {exc}")
@@ -792,7 +940,7 @@ class DraftSliceSpeculatorMixin:
     ) -> None:
         """Advance worker-side matchers by the tokens the target just sampled."""
 
-        if self._draftslice_shadow is None:
+        if self._draftslice_shadow is None or not self._policy_allows_work():
             return
         t0 = time.perf_counter()
         try:
@@ -844,11 +992,33 @@ class DraftSliceSpeculatorMixin:
     def propose(self, *args: Any, **kwargs: Any) -> Any:
         if not self._draftslice_slicing:
             return super().propose(*args, **kwargs)
+        adapter_policy = self._draftslice_adapter_policy
+        hold = None if adapter_policy is None else adapter_policy.hold_reason
+        if adapter_policy is not None and adapter_policy.uses_table and hold is not None:
+            # observe/off/disabled-only execute the stock path with no shadow,
+            # mapping, or valid-set work: the A/A gate needs byte-identical
+            # built-in behaviour, not merely identical output.
+            self._draftslice_stats.propose_calls += 1
+            self._draftslice_stats.profile_table = adapter_policy.table_path
+            self._draftslice_stats.profile_hash = adapter_policy.table_hash
+            self._draftslice_policy_hold = hold.value
+            self._record_policy(
+                PolicyDecision(
+                    action="builtin",
+                    mode="builtin",
+                    profile_mode=adapter_policy.profile_mode,
+                    reason=hold,
+                )
+            )
+            self._draftslice_stats.note_fallback(hold.value)
+            self._draftslice_route_full = False
+            return super().propose(*args, **kwargs)
         self._draftslice_stats.propose_calls += 1
+        self._draftslice_policy_hold = None
         input_batch = args[0] if args else kwargs.get("input_batch")
         if self._draftslice_graph_replay:
             self._prepare_graph_mask(input_batch)
-        if _router_enabled() and input_batch is not None:
+        if _router_enabled() and self._tp_world_size() == 1 and input_batch is not None:
             if not self._batch_has_grammar(input_batch):
                 # No row can use a valid set: take the stock path without
                 # shadow/mapping/logits bookkeeping.
@@ -1081,12 +1251,19 @@ class DraftSliceSpeculatorMixin:
             ]
             _TIMING["valid"] += time.perf_counter() - t0
             _TIMING["calls"] += 1
+            self._draftslice_row_workloads = [
+                shadow.workload(int(state))
+                if shadow.has(int(state))
+                else "structured"
+                for state in states
+            ]
             return result
 
         if (
             self._draftslice_snapshot is None
             or not self._draftslice_req_by_state
         ):
+            self._draftslice_row_workloads = None
             return None
         # The captured bitmask has one row per speculative position: row 0 is
         # the bonus/current token, row p is draft position p. Draft step 0 must
@@ -1097,6 +1274,9 @@ class DraftSliceSpeculatorMixin:
         )
         self._draftslice_stats.mask_stride = self._draftslice_snapshot.mask_stride
         max_ids = _max_slice_rows(self._draftslice_snapshot.vocab_size)
+        # The scheduler snapshot does not carry the structured request type;
+        # label the rows "structured" so no cell can over-claim a workload.
+        self._draftslice_row_workloads = ["structured"] * len(states)
         return [
             self._snapshot_valid_ids(int(state), max_ids=max_ids, position=position)
             for state in states
@@ -1279,6 +1459,245 @@ class DraftSliceSpeculatorMixin:
         self._draftslice_head_key = key
         self._draftslice_head_cache = (weight, shard)
         return weight, shard
+
+    # -- production policy -------------------------------------------------
+    def _policy_allows_work(self) -> bool:
+        """Observe/off/disabled-only must not pay shadow bookkeeping."""
+
+        adapter = self._draftslice_adapter_policy
+        if adapter is None or not adapter.uses_table:
+            return True
+        return adapter.hold_reason is None
+
+    def _policy_model_name(self) -> str:
+        model_config = getattr(getattr(self, "vllm_config", None), "model_config", None)
+        raw = getattr(model_config, "model", None) or ""
+        text = str(raw).rstrip("/")
+        if not text:
+            return ""
+        # Cell keys use the model directory/name ("Qwen3.5-4B"), not the full
+        # local path used by the engine.
+        return text.rsplit("/", 1)[-1] if "/" in text else text
+
+    def _policy_method_name(self) -> str:
+        spec = getattr(getattr(self, "vllm_config", None), "speculative_config", None)
+        method = str(getattr(spec, "method", "") or "")
+        # vLLM resolves a registered speculative method to its base family
+        # ("mtp"/"eagle3"/"dflash"). Cell keys name the DraftSlice profile, so
+        # the DraftSlice adapter prefixes the family it runs.
+        if method in ("mtp", "eagle3", "dflash"):
+            return f"draftslice_{method}"
+        return method
+
+    def _policy_quant(self) -> str:
+        model_config = getattr(getattr(self, "vllm_config", None), "model_config", None)
+        quant = getattr(model_config, "quantization", None)
+        if quant:
+            return str(quant).lower()
+        dtype = getattr(model_config, "dtype", None)
+        name = str(getattr(dtype, "name", dtype) or "").strip().lower()
+        if name.startswith("torch."):
+            name = name[len("torch.") :]
+        return {
+            "bfloat16": "bf16",
+            "float16": "fp16",
+            "float32": "fp32",
+            "float8_e4m3fn": "fp8",
+            "float8_e5m2": "fp8",
+            "int8": "int8",
+        }.get(name, name or "auto")
+
+    def _row_workloads(self, rows: int) -> list[str]:
+        workloads = self._draftslice_row_workloads
+        if workloads is not None and len(workloads) >= rows:
+            return list(workloads[:rows])
+        return ["structured"] * rows
+
+    def _decide_policy(self, valid_sets: Any) -> PolicyDecision | None:
+        adapter = self._draftslice_adapter_policy
+        if adapter is None or adapter.policy is None:
+            return None
+        workloads = self._row_workloads(len(valid_sets))
+        rows = tuple(
+            RowFacts(
+                workload=workload,
+                valid_size=0 if token_set is None else len(token_set),
+            )
+            for workload, token_set in zip(workloads, valid_sets, strict=True)
+        )
+        model_name, method_name, quant, tp_size = getattr(
+            self,
+            "_draftslice_policy_identity",
+            (
+                self._policy_model_name(),
+                self._policy_method_name(),
+                self._policy_quant(),
+                self._tp_world_size(),
+            ),
+        )
+        facts = StepFacts(
+            engine="vllm",
+            model=model_name,
+            method=method_name,
+            batch=len(rows),
+            k=int(getattr(self, "num_speculative_steps", 0) or 0),
+            tp=tp_size,
+            quant=quant,
+            graph="full_cuda_graph"
+            if getattr(self, "_draftslice_graph_replay", False)
+            else "eager",
+            rows=rows,
+            capabilities={
+                "grammar": any(row.valid_size > 0 for row in rows),
+                "graph": not getattr(self, "_draftslice_graph_replay", False),
+            },
+        )
+        decision = adapter.policy.decide(facts)
+        if _debug_on():
+            _tp_debug(
+                "policy facts "
+                f"model={facts.model!r} method={facts.method!r} "
+                f"batch={facts.batch} k={facts.k} tp={facts.tp} "
+                f"quant={facts.quant!r} graph={facts.graph!r} "
+                f"rows={[(row.workload, row.valid_size) for row in rows][:4]} "
+                f"-> {decision.to_dict()}"
+            )
+        self._record_policy(
+            decision,
+            rows=len(rows),
+            candidates=sum(
+                row.valid_size for row, hit in zip(rows, decision.row_mask, strict=True)
+                if hit
+            ),
+        )
+        return decision
+
+    def _record_policy(
+        self, decision: PolicyDecision, *, rows: int = 0, candidates: int = 0
+    ) -> None:
+        stats = self._draftslice_stats
+        self._draftslice_policy_decision = decision
+        stats.profile_mode = decision.profile_mode
+        stats.cell_id = decision.cell_id
+        stats.cell_hit = decision.cell_hit
+        stats.action = decision.action
+        if decision.executes_slice:
+            stats.policy_slice_steps += 1
+        else:
+            stats.policy_full_steps += 1
+        if (
+            self._draftslice_traces is not None
+            and self._draftslice_trace_sampler is not None
+            and self._draftslice_trace_sampler()
+        ):
+            vocab = max(1, int(getattr(self, "vocab_size", 0) or 1))
+            self._draftslice_traces.add(
+                StepTrace(
+                    identity=TraceIdentity(
+                        engine="vllm",
+                        model=self._policy_model_name() or "unknown",
+                        tp=self._tp_world_size(),
+                        quant=self._policy_quant(),
+                        graph="full_cuda_graph"
+                        if getattr(self, "_draftslice_graph_replay", False)
+                        else "eager",
+                        workload=decision.workload or "unknown",
+                        config_hash=stats.profile_hash,
+                    ),
+                    decision=TraceDecision(
+                        mode=decision.mode,
+                        action=decision.action,
+                        profile_mode=decision.profile_mode,
+                        source="policy"
+                        if self._draftslice_adapter_policy is not None
+                        else "builtin",
+                        k=int(getattr(self, "num_speculative_steps", 0) or 0),
+                        cell_id=decision.cell_id,
+                        cell_hit=decision.cell_hit,
+                        reason=None
+                        if decision.executes_slice
+                        else decision.reason.value,
+                        candidates=int(candidates),
+                        rows=int(rows),
+                        row_share=min(
+                            1.0, float(candidates) / float(max(1, rows) * vocab)
+                        ),
+                    ),
+                    timing=TraceTiming(),
+                )
+            )
+            stats.trace_count = self._draftslice_traces.recorded
+
+    def _tp_world_size(self) -> int:
+        """Tensor-parallel size from the engine config (1 when unknown)."""
+
+        config = getattr(self, "vllm_config", None)
+        parallel = getattr(config, "parallel_config", None)
+        try:
+            return max(1, int(getattr(parallel, "tensor_parallel_size", 1) or 1))
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            return 1
+
+    def _tp_plan_callbacks(
+        self, shard: HeadShard | None
+    ) -> tuple[Any | None, Any | None]:
+        """Return ``(plan_agreement, combine_logits)`` for a TP>1 head shard.
+
+        The engine samples (and advances the worker grammar shadow) on every
+        rank, so a rank-local sliced tensor lets the ranks diverge: different
+        draft tokens fork the shadow differently, and the next step's full-head
+        row sets stop matching. The engine's own full-head path all-gathers the
+        logits for exactly this reason; the sliced path must do the same.
+
+        ``combine_logits`` max-reduces the partial rows (each column is scored
+        by one rank, all other contributions are ``-inf``, which is the max
+        identity). ``plan_agreement`` unions
+        the full-head row set with a tiny collective before the bigger one, so
+        no rank can enter the engine's logits all-gather alone.
+        """
+
+        if shard is None or int(shard.tp_size) <= 1:
+            return None, None
+        cached = self._draftslice_tp_plan
+        if cached is not None and cached[0] == int(shard.tp_size):
+            return cached[1], cached[2]
+        tp_size = int(shard.tp_size)
+        try:
+            import torch
+            from vllm.distributed import tensor_model_parallel_all_gather
+        except Exception as exc:  # pragma: no cover - engine import guard
+            self._draftslice_stats.record_error(f"tp collectives: {exc}")
+            # A rank that cannot join the collectives must not silently fall
+            # back: the other ranks would deadlock in the engine all-gather.
+            raise
+
+        def plan_agreement(
+            rows: int, full_rows: Any, device: Any
+        ) -> list[int]:
+            flags = torch.zeros(rows, dtype=torch.int32, device=device)
+            local = list(full_rows)
+            if local:
+                index = torch.as_tensor(local, dtype=torch.int64, device=device)
+                flags[index] = 1
+            _tp_debug(f"agree enter rows={rows} local={local}")
+            gathered = tensor_model_parallel_all_gather(flags, dim=0)
+            agreed = gathered.view(tp_size, rows).amax(dim=0)
+            result = agreed.nonzero(as_tuple=False).flatten().tolist()
+            _tp_debug(f"agree exit rows={rows} agreed={result}")
+            return result
+
+        def combine_logits(logits: Any) -> Any:
+            rows = int(logits.shape[0])
+            _tp_debug(f"combine enter shape={tuple(logits.shape)}")
+            gathered = tensor_model_parallel_all_gather(
+                logits.contiguous(), dim=-1
+            )
+            result = gathered.view(rows, tp_size, -1).amax(dim=1)
+            _tp_debug(f"combine exit shape={tuple(result.shape)}")
+            return result
+
+        self._draftslice_tp_plan = (tp_size, plan_agreement, combine_logits)
+        return plan_agreement, combine_logits
 
     def _prepare_weight(
         self,
@@ -1520,14 +1939,12 @@ class DraftSliceSpeculatorMixin:
 
         import torch
 
-        logits = self.compute_draft_logits(hidden_states, spec_step_idx)
+        logits = self.compute_draft_logits(hidden_states, spec_step_idx, _combine=False)
         values, ids = logits.max(dim=-1)
         shard = self._draftslice_shard
         if shard is not None and shard.tp_size > 1:
             try:
-                from vllm.distributed.parallel_state import (
-                    tensor_model_parallel_all_gather,
-                )
+                from vllm.distributed import tensor_model_parallel_all_gather
 
                 pairs = torch.stack((values.float(), ids.float()), dim=-1)
                 gathered = tensor_model_parallel_all_gather(pairs, dim=-1)
@@ -1545,8 +1962,17 @@ class DraftSliceSpeculatorMixin:
             ids = ids + draft_to_target[ids]
         return ids
 
-    def compute_draft_logits(self, hidden_states: Any, spec_step_idx: int) -> Any:
+    def compute_draft_logits(
+        self, hidden_states: Any, spec_step_idx: int, *, _combine: bool = True
+    ) -> Any:
         base_compute = super().compute_draft_logits
+        if _debug_on():
+            _tp_debug(
+                f"compute enter step={getattr(self, '_draftslice_step', 0)} "
+                f"rows={int(hidden_states.shape[0])} combine={_combine} "
+                f"shadow={getattr(self, '_draftslice_shadow', None) is not None} "
+                f"graph={getattr(self, '_draftslice_graph_replay', False)}"
+            )
 
         def fallback(reason: str | None, valid_sets: Any = None) -> Any:
             return self._fallback(
@@ -1594,6 +2020,9 @@ class DraftSliceSpeculatorMixin:
             return fallback("router_freeform")
         if self._draftslice_dummy:
             return fallback("dummy_run")
+        if self._draftslice_policy_hold is not None:
+            # observe/off: stock path, no valid-set or shadow work at all.
+            return fallback(self._draftslice_policy_hold)
         if self._draftslice_block and _block_allpos_enabled():
             allpos = self._compute_block_allpos(hidden_states, spec_step_idx, base_compute)
             if allpos is not None:
@@ -1648,7 +2077,21 @@ class DraftSliceSpeculatorMixin:
             if not any(token_set is not None for token_set in valid_sets):
                 return fallback("screener_empty", valid_sets)
 
-        if _full_mask_enabled():
+        policy_decision = self._decide_policy(valid_sets)
+        contract_mode: str | None = None
+        if policy_decision is not None:
+            if not policy_decision.executes_slice:
+                return fallback(policy_decision.reason.value, valid_sets)
+            if policy_decision.action == "mask_allpos" and not self._draftslice_block:
+                return fallback("capability_unsupported", valid_sets)
+            # Only rows with an enabled exact cell keep their valid set; the
+            # rest use the full head inside the same batch.
+            valid_sets = filter_valid_sets(valid_sets, policy_decision.row_mask)
+            contract_mode = policy_decision.mode
+
+        if _full_mask_enabled() or (
+            policy_decision is not None and policy_decision.action == "mask"
+        ):
             vocab = min(
                 int(getattr(self, "vocab_size", int(hidden_states.shape[1]))),
                 int(hidden_states.shape[1]),
@@ -1690,6 +2133,11 @@ class DraftSliceSpeculatorMixin:
                 if token_set is not None and len(token_set) == 1
             )
         t0 = time.perf_counter()
+        plan_agreement, combine_logits = self._tp_plan_callbacks(shard)
+        if not _combine:
+            # The local-argmax hook reduces ``(value, id)`` pairs across ranks
+            # itself, so it only needs this rank's columns.
+            combine_logits = None
         try:
             slicing_weight = self._prepare_weight(
                 weight,
@@ -1726,15 +2174,26 @@ class DraftSliceSpeculatorMixin:
                 soft_cap=soft_cap,
                 deterministic=deterministic,
                 shard=shard,
+                plan_agreement=plan_agreement,
+                combine_logits=combine_logits,
             )
-        except Exception as exc:  # pragma: no cover - defensive
+        except Exception as exc:
+            # A rank-local fallback would enter (or skip) the engine's TP logits
+            # all-gather on this rank only and deadlock the others. Fail the
+            # step loudly instead; the engine restarts the request.
             self._draftslice_stats.record_error(f"{type(exc).__name__}: {exc}")
+            if shard is not None and int(shard.tp_size) > 1:
+                raise
             return fallback("build_error", valid_sets)
 
         _TIMING["build"] += time.perf_counter() - t0
         self._draftslice_stats.record(sliced=True, stats=stats)
+        self._draftslice_stats.row_share = compute_row_share(
+            stats.candidate_total, stats.rows, vocab_size
+        )
         self._emit_contract(
-            mode="mask" if (self._draftslice_block or screener_active) else "strict",
+            mode=contract_mode
+            or ("mask" if (self._draftslice_block or screener_active) else "strict"),
             valid_sets=valid_sets,
             logits_stats=stats,
             vocab_size=vocab_size,

@@ -49,7 +49,11 @@ The current engine path exercises the strict grammar slice directly (worker
 shadow + candidate rows + fused kernel). The offline plan/compiler, cost model,
 scheduler, union executor, and candidate/row caches are implemented and tested,
 but they are **not yet the production engine path**; wiring them into the engine
-is tracked in [docs/architecture.md](docs/architecture.md). Research code,
+is tracked in [docs/architecture.md](docs/architecture.md). The production
+control plane has started: `runtime/reasons.py` (stable fallback codes),
+`runtime/trace.py` (`trace/1` step records), `runtime/profile.py` (hashed
+`profiles/1` profit table) and `runtime/config.py` (`config/1` TOML + env
+overlay). The policy that consumes them is the next milestone. Research code,
 experimental data, and benchmark results are intentionally not part of this
 repository.
 
@@ -163,15 +167,33 @@ one-step-ahead scheduler bitmask. DFlash slices block position 0 the same way;
 later block positions stay on the full head. **Slicing is profile-gated**
 (`DRAFTSLICE_PROFILE_MODE=observe|enforce`): the default is built-in, because
 free-form and some structured workloads regress when slicing is enabled
-globally. Covered engine paths: TP>1 via per-rank vocabulary shards, quantized
-heads via candidate-row dequantization, reasoning parsers via a boundary-gated
-shadow, local-argmax reduction via a sliced `get_draft_top_tokens` override, and
-FULL decode graphs via a pre-replay static packed bitmask. Every decision emits
-a `DraftContract` with the fail-closed reason; inspect `draftslice_stats()` for
-`fallback_reasons`, `last_contract`, and TP shard fields. The target verifier
-remains exact. See
+globally. Covered engine paths: TP>1 via per-rank vocabulary shards with a
+cross-rank max-reduce of the partial logits and an agreed full-head row set (the
+2026-11-22 MoE TP=2 hang was rank-local logits; it is fixed and has a two-rank
+regression test), quantized heads via candidate-row dequantization, reasoning
+parsers via a boundary-gated shadow, local-argmax reduction via a sliced
+`get_draft_top_tokens` override, and FULL decode graphs via a pre-replay static
+packed bitmask. Every decision emits a `DraftContract` with the fail-closed
+reason; inspect `draftslice_stats()` for `fallback_reasons`, `last_contract`,
+`tp_combined_calls`, and TP shard fields. The target verifier remains exact. See
 [docs/architecture.md §16](docs/architecture.md#16-vllm-integration) for the hook
 points and limitations.
+
+The production policy is table-driven:
+
+```bash
+vllm serve ... --speculative-config '{"method":"draftslice_mtp","num_speculative_tokens":8}' \
+  DRAFTSLICE_PROFILE_TABLE=profiles/4b.json \
+  DRAFTSLICE_PROFILE_MODE=enforce          # off | observe | enforce
+```
+
+`off`/`observe` execute the stock path with no shadow or valid-set work;
+`enforce` slices only rows whose exact `(model, engine, method, workload, batch,
+k, tp, quant, graph, valid)` cell is enabled. A missing, disabled, or
+engine-mismatched cell is built-in; a missing table file or hash mismatch is a
+hard startup error. vLLM only exposes the grammar format, so a deployment maps
+formats onto workload classes explicitly, e.g.
+`DRAFTSLICE_WORKLOAD_MAP='{"json":"tool_call","json_object":"tool_call"}'`.
 
 DFlash support: `draftslice_dflash` slices block position 0 with the exact
 worker shadow. Later block positions stay on the full head because their grammar
@@ -189,9 +211,10 @@ state depends on draft tokens sampled inside the same parallel block. See
   runtime autotuning (done); a tree-specific fused union kernel and engine-owned
   graph buckets remain
 - **M4** vLLM integration: plugin, strict draft-step-0 path, worker shadow, and
-  structured end-to-end runs (done), per-rank TP>1 shard slicing, a concrete
-  `DraftContract`, quantized heads, reasoning parsers, local-argmax and FULL-graph
-  contracts (done); default routing and server-level tau/latency tuning next
+  structured end-to-end runs (done), per-rank TP>1 shard slicing with replicated
+  logits, a concrete `DraftContract`, quantized heads, reasoning parsers,
+  local-argmax and FULL-graph contracts (done); the production policy/profile
+  table wiring and server-level tau/latency tuning are next
 - **M5** fair baseline suite (implemented, including CFHead/FlashHead reference
   policies), artifact/partition/conformal core, calibrated plan compilation,
   the acceptance model, router training, screener artifacts, and the factorial

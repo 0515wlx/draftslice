@@ -336,15 +336,27 @@ class ServingPoint:
     source: str = "builtin"
     expected_tau: float | None = None
     target_metric: str = "throughput"
-    head_share: float | None = None
+    # Fraction of the vocabulary rows a slice reads. This is *not* the measured
+    # draft-head share of step time; the two were conflated in the first
+    # experiments. ``measured_head_share`` is filled from B4 timing.
+    row_share: float | None = None
+    measured_head_share: float | None = None
 
     def __post_init__(self) -> None:
         if self.k < 0:
             raise ValueError("k must be non-negative")
         if self.expected_tau is not None and self.expected_tau < 0:
             raise ValueError("expected_tau must be non-negative")
-        if self.head_share is not None and not (0.0 <= self.head_share <= 1.0):
-            raise ValueError("head_share must be in [0, 1]")
+        for name in ("row_share", "measured_head_share"):
+            value = getattr(self, name)
+            if value is not None and not (0.0 <= value <= 1.0):
+                raise ValueError(f"{name} must be in [0, 1]")
+
+    @property
+    def head_share(self) -> float | None:
+        """Deprecated alias for the row share; use ``row_share`` in new code."""
+
+        return self.row_share
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -352,7 +364,8 @@ class ServingPoint:
             "source": self.source,
             "expected_tau": self.expected_tau,
             "target_metric": self.target_metric,
-            "head_share": self.head_share,
+            "row_share": self.row_share,
+            "measured_head_share": self.measured_head_share,
         }
 
 
