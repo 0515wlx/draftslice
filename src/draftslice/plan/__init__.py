@@ -9,14 +9,19 @@ from __future__ import annotations
 
 from .compiler import Budget, PlanBudgetError, PlanCompiler, PlanPolicy
 from .types import (
+    ContractMode,
+    DraftContract,
     Execution,
+    FallbackRule,
     Guarantee,
     GuaranteeKind,
+    GuaranteeScope,
     HeadPlan,
     KernelKind,
     LayoutKind,
     NodePlan,
     PlanCost,
+    ServingPoint,
     Slice,
     StepPlan,
     TokenSet,
@@ -25,9 +30,13 @@ from .types import (
 
 __all__ = [
     "Budget",
+    "ContractMode",
+    "DraftContract",
     "Execution",
+    "FallbackRule",
     "Guarantee",
     "GuaranteeKind",
+    "GuaranteeScope",
     "HeadPlan",
     "KernelKind",
     "LayoutKind",
@@ -36,6 +45,7 @@ __all__ = [
     "PlanCompiler",
     "PlanCost",
     "PlanPolicy",
+    "ServingPoint",
     "Slice",
     "StepPlan",
     "TokenSet",

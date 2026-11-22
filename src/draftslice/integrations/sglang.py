@@ -30,8 +30,16 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 from ..constraints.xgrammar import bitmask_to_token_set
-from ..plan.types import TokenSet
+from ..plan.types import (
+    DraftContract,
+    Execution,
+    Guarantee,
+    GuaranteeKind,
+    ServingPoint,
+    TokenSet,
+)
 from ..screen.base import Screener
+from .head_shard import HeadShard
 from .vllm_logits import build_draft_logits
 
 _REGISTERED = False
@@ -44,7 +52,90 @@ _ORIGINAL_LM_HEAD: Any | None = None
 _ORIGINAL_DRAFTS: dict[type, Any] = {}
 _SCREENER: Screener | None = None
 _SCREENER_READY = False
-_STATS = {"step0_calls": 0, "sliced_calls": 0, "candidate_rows": 0, "fallback_calls": 0}
+_STATS: dict[str, Any] = {
+    "step0_calls": 0,
+    "sliced_calls": 0,
+    "candidate_rows": 0,
+    "fallback_calls": 0,
+    "fallback_reasons": {},
+    "last_contract": None,
+    "tp_size": 1,
+    "tp_rank": 0,
+}
+
+
+def _note_fallback(reason: str) -> None:
+    reasons = _STATS["fallback_reasons"]
+    reasons[reason] = reasons.get(reason, 0) + 1
+
+
+def _contract_reason(lm_head: Any) -> str:
+    """Why this head cannot be sliced (used in the emitted full contract)."""
+
+    weight = getattr(lm_head, "weight", None)
+    if weight is None or getattr(weight, "device", None) is None:
+        return "no_weight"
+    if weight.device.type != "cuda":
+        return "no_cuda_weight"
+    quant_method = getattr(lm_head, "quant_method", None)
+    if quant_method is not None and "unquant" not in type(quant_method).__name__.lower():
+        return "quantized_head"
+    num_embeddings = getattr(lm_head, "num_embeddings", None)
+    if num_embeddings is not None and int(num_embeddings) != int(weight.shape[0]):
+        return "padded_or_sharded_head"
+    return "unsupported_head"
+
+
+def _emit_contract(
+    *,
+    mode: str,
+    reason: str | None = None,
+    valid_sets: Any = None,
+    candidates: int = 0,
+    rows: int = 0,
+    vocab_size: int = 0,
+) -> None:
+    """Emit the stable contract for a step, following the production data model."""
+
+    state = _DRAFT_STATE.get()
+    k = int(state.get("topk", 0)) if state else 0
+    ids: set[int] = set()
+    for token_set in valid_sets or ():
+        if token_set is not None:
+            ids.update(token_set.ids)
+    valid = TokenSet(ids) if ids else None
+    if mode == "full":
+        execution = Execution(kind="full")
+        # SGLang's fallback is the engine's own full-head path, not a
+        # DraftSlice-managed full-head mask.
+        guarantee = Guarantee(
+            kind=GuaranteeKind.FULL, universe="vocab", fallback_rule="built_in_method"
+        )
+        candidate_set = None
+        head_share = None
+    else:
+        execution = Execution(kind="slice_gemv", rows=valid)
+        guarantee = Guarantee.exact_valid_set()
+        candidate_set = valid
+        head_share = candidates / (rows * vocab_size) if rows and vocab_size else None
+    contract = DraftContract(
+        grammar_state_id=None,
+        valid_set=valid,
+        candidate_set=candidate_set,
+        mode=mode,
+        execution=execution,
+        guarantee=guarantee,
+        serving=ServingPoint(
+            k=k,
+            source="draftslice_sglang",
+            target_metric="throughput",
+            head_share=head_share,
+        ),
+        fallback_reason=reason,
+    )
+    _STATS["last_contract"] = contract.to_dict()
+    if reason is not None:
+        _note_fallback(reason)
 
 
 class SglangIntegrationError(RuntimeError):
@@ -212,16 +303,19 @@ def _sliceable_weight(lm_head: Any) -> Any | None:
         return None
     if weight.device.type != "cuda":
         return None
-    if getattr(lm_head, "tp_size", 1) != 1:
-        return None
     quant_method = getattr(lm_head, "quant_method", None)
     if quant_method is not None and "unquant" not in type(quant_method).__name__.lower():
         return None
-    num_embeddings = getattr(lm_head, "num_embeddings", None)
-    if num_embeddings is not None and int(num_embeddings) != int(weight.shape[0]):
-        # A sharded/padded head must not be sliced as if it were the full vocab.
+    if _head_shard(lm_head, weight) is None:
         return None
     return weight
+
+
+def _head_shard(lm_head: Any, weight: Any) -> HeadShard | None:
+    vocab_size = int(getattr(lm_head, "num_embeddings", 0) or weight.shape[0])
+    return HeadShard.from_lm_head(
+        lm_head, weight_rows=int(weight.shape[0]), vocab_size=vocab_size
+    )
 
 
 def _patched_compute_lm_head(
@@ -248,9 +342,12 @@ def _patched_compute_lm_head(
     config: SglangConfig = state["config"]
     state["step"] = step + 1
     _STATS["step0_calls"] += 1
+    _STATS["tp_size"] = int(getattr(lm_head, "tp_size", 1) or 1)
+    _STATS["tp_rank"] = int(getattr(lm_head, "tp_rank", 0) or 0)
     weight = _sliceable_weight(lm_head)
     if weight is None:
         _STATS["fallback_calls"] += 1
+        _emit_contract(mode="full", reason=_contract_reason(lm_head))
         if os.environ.get("DRAFTSLICE_SGLANG_DEBUG") == "1":
             import sys
 
@@ -270,12 +367,18 @@ def _patched_compute_lm_head(
             self, hidden_states, lm_head, embedding_bias, out=out
         )
     rows = int(hidden_states.shape[0])
-    vocab_size = min(int(getattr(self, "vocab_size", weight.shape[0])), weight.shape[0])
+    shard = _head_shard(lm_head, weight)
+    # The grammar mask is over global token ids; the kernel reads local rows.
+    global_vocab = int(
+        getattr(self, "vocab_size", getattr(lm_head, "num_embeddings", weight.shape[0]))
+        or weight.shape[0]
+    )
+    kernel_vocab = int(weight.shape[0])
     state["hidden_states"] = hidden_states
     candidates = _grammar_candidates(
         state,
         rows,
-        vocab_size,
+        global_vocab,
         max_rows=config.max_rows,
         device=hidden_states.device,
         screener=_ensure_screener(config),
@@ -283,6 +386,7 @@ def _patched_compute_lm_head(
     )
     if candidates is None:
         _STATS["fallback_calls"] += 1
+        _emit_contract(mode="full", reason="no_candidates")
         if os.environ.get("DRAFTSLICE_SGLANG_DEBUG") == "1":
             import sys
 
@@ -295,27 +399,51 @@ def _patched_compute_lm_head(
             self, hidden_states, lm_head, embedding_bias, out=out
         )
 
+    # _compute_lm_head returns rank-local logits; SGLang gathers them later.
+    # A TP rank therefore slices its own shard with local row ids and returns
+    # local logits, so no TP collective is needed inside this hook.
+    if shard is not None and shard.tp_size > 1:
+        local_candidates: list[Any] = []
+        for token_set in candidates:
+            if token_set is None:
+                local_candidates.append(None)
+                continue
+            local_ids = tuple(
+                row
+                for row in (shard.local_row(token) for token in token_set.ids)
+                if row is not None and 0 <= row < kernel_vocab
+            )
+            local_candidates.append(TokenSet(local_ids) if local_ids else None)
+        candidates = local_candidates
+
     def full_logits(subset: Any) -> Any:
         return _ORIGINAL_LM_HEAD(self, subset, lm_head, embedding_bias, out=None)
 
     try:
-        logits, _ = build_draft_logits(
+        logits, stats = build_draft_logits(
             hidden_states,
-            weight[:vocab_size],
+            weight[:kernel_vocab],
             candidates,
-            vocab_size=vocab_size,
+            vocab_size=kernel_vocab,
             full_logits=full_logits,
             max_slice_rows=config.max_rows,
         )
     except Exception:
         _STATS["fallback_calls"] += 1
+        _emit_contract(mode="full", reason="build_error")
         return _ORIGINAL_LM_HEAD(
             self, hidden_states, lm_head, embedding_bias, out=out
         )
     state["sliced_calls"] = int(state.get("sliced_calls", 0)) + 1
     _STATS["sliced_calls"] += 1
-    _STATS["candidate_rows"] += sum(
-        0 if tokens is None else len(tokens) for tokens in candidates
+    candidate_rows = sum(0 if tokens is None else len(tokens) for tokens in candidates)
+    _STATS["candidate_rows"] += candidate_rows
+    _emit_contract(
+        mode="mask",
+        valid_sets=candidates,
+        candidates=getattr(stats, "candidate_total", candidate_rows),
+        rows=getattr(stats, "rows", rows),
+        vocab_size=kernel_vocab,
     )
     if os.environ.get("DRAFTSLICE_SGLANG_DEBUG") == "1":
         import sys

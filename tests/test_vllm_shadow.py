@@ -50,11 +50,106 @@ def make_registry() -> GrammarShadowRegistry:
     return registry
 
 
+class FakeReasoningEnd:
+    def __init__(self, offset: int, implicit: bool = False) -> None:
+        self.offset = offset
+        self.implicit = implicit
+
+
+class FakeReasoner:
+    reasoning_end_token_ids = [13]
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def find_reasoning_end(self, tokens):
+        self.calls += 1
+        if 13 in tokens:
+            index = tokens.index(13)
+            return FakeReasoningEnd(index)
+        return FakeReasoningEnd(len(tokens))
+
+
+def test_reasoning_parser_no_longer_disables_the_shadow() -> None:
+    class Config(FakeConfig):
+        class StructuredOutputsConfig(FakeConfig.StructuredOutputsConfig):
+            reasoning_parser = "deepseek_r1"
+
+    registry = GrammarShadowRegistry(Config(), max_ids=32)
+    assert registry.enabled
+
+
+def test_reasoning_boundary_gates_the_grammar() -> None:
+    registry = make_registry()
+    grammar = FakeGrammar({1, 2})
+    reasoner = FakeReasoner()
+    entry = _ShadowEntry(
+        req_id="a",
+        grammar=grammar,
+        state_key=b"a",
+        reasoner=reasoner,
+        grammar_active=False,
+    )
+    registry.entries[0] = entry
+    # Before the end token the grammar is not exposed at all.
+    assert registry.valid_ids(0) is None
+    assert registry.row_mask(0, vocab_size=64) is None
+    assert registry._advance_reasoning(entry, [10, 11]) == []
+    assert not entry.grammar_active
+    # The explicit end token is skipped; only the following token is grammar.
+    assert registry._advance_reasoning(entry, [13, 1]) == [1]
+    assert entry.grammar_active
+    assert registry.stats["reasoning_activated"] == 1
+    assert registry.valid_ids(0) == TokenSet([1, 2])
+
+
+def test_implicit_reasoning_end_token_is_grammar_content() -> None:
+    class Implicit(FakeReasoner):
+        def find_reasoning_end(self, tokens):
+            if 13 in tokens:
+                return FakeReasoningEnd(tokens.index(13), implicit=True)
+            return FakeReasoningEnd(len(tokens))
+
+    registry = make_registry()
+    entry = _ShadowEntry(
+        req_id="a",
+        grammar=FakeGrammar({1}),
+        state_key=b"a",
+        reasoner=Implicit(),
+        grammar_active=False,
+    )
+    assert registry._advance_reasoning(entry, [13, 1]) == [13, 1]
+
+
 def test_mix_key_is_prefix_and_token_sensitive() -> None:
     base = b"schema"
     assert _mix_key(base, [1, 2]) == _mix_key(base, [1, 2])
     assert _mix_key(base, [1, 2]) != _mix_key(base, [2, 1])
     assert _mix_key(base, [1]) != _mix_key(base, [1, 2])
+
+
+def test_row_mask_unpacks_bitmask_without_tokenset() -> None:
+    registry = make_registry()
+    grammar = FakeGrammar({0, 1, 33, 63})
+    registry.entries[0] = _ShadowEntry(req_id="a", grammar=grammar, state_key=b"a")
+    mask = registry.row_mask(0, vocab_size=64)
+    assert mask is not None
+    expected = torch.zeros(64, dtype=torch.bool)
+    expected[[0, 1, 33, 63]] = True
+    assert torch.equal(mask, expected)
+    assert grammar.filled == 1
+
+
+def test_row_mask_falls_back_for_terminated_or_missing_step() -> None:
+    registry = make_registry()
+    registry.entries[0] = _ShadowEntry(
+        req_id="a", grammar=FakeGrammar({1}, terminated=True), state_key=b"a"
+    )
+    assert registry.row_mask(0, vocab_size=64) is None
+    registry.entries[1] = _ShadowEntry(
+        req_id="b", grammar=FakeGrammar({1}), state_key=b"b"
+    )
+    assert registry.row_mask(1, step=2, vocab_size=64) is None
 
 
 def test_valid_ids_caches_by_state_key() -> None:

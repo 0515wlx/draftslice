@@ -20,6 +20,7 @@ import numpy as np
 from ..kernels.torch import TorchGatherKernel
 from ..kernels.triton import TritonSliceKernel
 from ..plan.types import TokenSet
+from .head_shard import HeadShard, restrict_to_rank
 
 try:  # pragma: no cover - optional dependency
     import torch
@@ -38,6 +39,10 @@ class DraftSliceLogitsStats:
     full_rows: int
     candidate_total: int
     distinct_sets: int
+    # Rows that kept the full head because at least one rank owns no token of
+    # the valid set. The decision is identical on every rank (required by the
+    # TP logits all-gather) and the result is masked to V.
+    masked_full_rows: int = 0
 
     def to_dict(self) -> dict[str, int]:
         return {
@@ -46,6 +51,7 @@ class DraftSliceLogitsStats:
             "full_rows": self.full_rows,
             "candidate_total": self.candidate_total,
             "distinct_sets": self.distinct_sets,
+            "masked_full_rows": self.masked_full_rows,
         }
 
 
@@ -178,6 +184,10 @@ def _upload(array: np.ndarray, device: Any) -> Any:
     return uploader.upload(array, device)
 
 
+# Public alias for the grammar shadow's per-position bitmask uploads.
+upload_numpy = _upload
+
+
 def _fused_max_width(max_rows: int) -> int:
     """Widest candidate bucket the per-row GEMV fast path should handle.
 
@@ -245,6 +255,66 @@ def _postprocess(values: Any, *, scale: float, soft_cap: float | None) -> Any:
     return values
 
 
+def mask_logits_to_valid(
+    logits: Any,
+    valid_sets: Sequence[TokenSet | None],
+    *,
+    vocab_size: int | None = None,
+) -> Any:
+    """Mask a full-vocabulary logits tensor to ``valid_sets``.
+
+    This is the *full-head + grammar-mask* control path. It is used to separate
+    two effects that are otherwise confounded in an end-to-end comparison:
+
+    - grammar-constrained draft sampling improves acceptance (``tau``);
+    - slicing the head removes the cost of scoring rows that can never be
+      sampled.
+
+    Rows with ``None`` or an empty/oversized set are left unchanged, matching
+    ``build_draft_logits``' fallback semantics. The returned tensor is a clone;
+    the caller's logits are not mutated.
+    """
+
+    if torch is None:
+        raise VllmLogitsError("torch is not installed")
+    if logits.ndim != 2:
+        raise VllmLogitsError("logits must be 2-D")
+    if len(valid_sets) != logits.shape[0]:
+        raise VllmLogitsError("valid_sets length does not match the batch")
+    vocab = int(logits.shape[1]) if vocab_size is None else int(vocab_size)
+    if vocab <= 0 or vocab > logits.shape[1]:
+        raise VllmLogitsError("vocab_size is outside the logits width")
+
+    out = logits.clone()
+    rows: list[int] = []
+    ids: list[int] = []
+    for row, token_set in enumerate(valid_sets):
+        if token_set is None or not token_set.ids:
+            continue
+        row_ids = token_set.ids
+        if row_ids[-1] >= vocab:
+            continue
+        rows.extend([row] * len(row_ids))
+        ids.extend(row_ids)
+    if not ids:
+        return out
+
+    # Vectorized scatter: one flat index build and one index_put. This is the
+    # fair full-head baseline for the slice path, so it must not pay a Python
+    # per-row masking loop that the slice path does not pay.
+    flat = torch.as_tensor(rows, dtype=torch.long, device=logits.device)
+    flat = flat * vocab + torch.as_tensor(ids, dtype=torch.long, device=logits.device)
+    values = out.reshape(-1)[flat]
+    # Only rows that have an exact set are fully masked; rows without a set
+    # keep the full-head values.
+    masked_rows = torch.as_tensor(
+        sorted(set(rows)), dtype=torch.long, device=logits.device
+    )
+    out[masked_rows] = float("-inf")
+    out.view(-1).index_put_((flat,), values)
+    return out
+
+
 def build_draft_logits(
     hidden_states: Any,
     weight: Any,
@@ -256,12 +326,19 @@ def build_draft_logits(
     kernel: Any | None = None,
     scale: float = 1.0,
     soft_cap: float | None = None,
+    deterministic: bool = False,
+    shard: HeadShard | None = None,
 ) -> tuple[Any, DraftSliceLogitsStats]:
     """Build ``[batch, vocab]`` logits with sliced rows and ``-inf`` elsewhere.
 
     ``valid_sets[i] is None`` means "no strict plan for this row"; those rows are
     computed by ``full_logits``. An empty or oversized valid set also falls back
     to the full head, because slicing it is not a strict-mode win.
+
+    With ``shard`` set (TP>1), global token ids are mapped to this rank's local
+    weight rows, scored there, and scattered back to global columns. Rows whose
+    valid set has no token on this rank use ``full_logits`` masked to V, so a
+    rank-local fallback cannot propose a grammar-invalid token.
     """
 
     if torch is None:
@@ -272,13 +349,58 @@ def build_draft_logits(
         raise VllmLogitsError("hidden width does not match the head weight")
     if len(valid_sets) != hidden_states.shape[0]:
         raise VllmLogitsError("valid_sets length does not match the batch")
-    if weight.shape[0] < vocab_size:
-        raise VllmLogitsError(f"weight has {weight.shape[0]} rows, need vocab_size={vocab_size}")
+    local_vocab = shard.shard_rows if shard is not None else vocab_size
+    if weight.shape[0] < local_vocab:
+        raise VllmLogitsError(
+            f"weight has {weight.shape[0]} rows, need {local_vocab} local rows"
+        )
 
     max_rows = vocab_size if max_slice_rows is None else max_slice_rows
     if max_rows <= 0:
         raise VllmLogitsError("max_slice_rows must be positive")
     kernel = kernel or _default_kernel()
+
+    # A single valid token is deterministic on every rank, regardless of which
+    # rank owns it. Inject it directly so a rank without a local row cannot turn
+    # the one-hot distribution into a full masked row.
+    det_rows: list[tuple[int, int]] = []
+    det_skip: set[int] = set()
+    if deterministic:
+        for row, token_set in enumerate(valid_sets):
+            if (
+                token_set is not None
+                and len(token_set) == 1
+                and token_set.ids[0] < vocab_size
+            ):
+                det_rows.append((row, token_set.ids[0]))
+                det_skip.add(row)
+
+    global_ids: dict[int, tuple[int, ...]] = {}
+    masked_full_rows: set[int] = set()
+    if shard is not None:
+        rank_sets = restrict_to_rank(valid_sets, shard, max_rows=max_rows)
+        effective: list[TokenSet | None] = []
+        for rank_set in rank_sets:
+            if rank_set is None:
+                effective.append(None)
+                continue
+            effective.append(rank_set.local)
+            global_ids[id(rank_set.local)] = rank_set.global_ids
+        # A full-head fallback invokes the engine's TP logits all-gather, which
+        # is collective: every rank must enter it for exactly the same rows.
+        # Decide from all ranks' id ranges, not from this rank's local subset.
+        for row, global_set in enumerate(valid_sets):
+            if (
+                row in det_skip
+                or global_set is None
+                or global_set.is_empty
+                or len(global_set) > max_rows
+            ):
+                continue
+            if any(count == 0 for count in shard.local_counts(global_set)):
+                masked_full_rows.add(row)
+    else:
+        effective = list(valid_sets)
 
     out = torch.full(
         (hidden_states.shape[0], vocab_size),
@@ -286,15 +408,24 @@ def build_draft_logits(
         dtype=torch.float32,
         device=hidden_states.device,
     )
-    head = weight[:vocab_size]
+    head = weight[:local_vocab]
 
-    fused = getattr(kernel, "supports_rows_into", False)
+    # The fused kernel writes logits straight into global columns, so it can only
+    # be used when local rows are already global token ids. Sharded ranks take the
+    # grouped gather+GEMM path and scatter through the global-id map below.
+    fused = getattr(kernel, "supports_rows_into", False) and shard is None
     fused_max_width = _fused_max_width(max_rows) if fused else 0
     full_rows: list[int] = []
     groups: dict[int, tuple[Any, list[int]]] = {}
     buckets: dict[int, list[tuple[int, TokenSet]]] = {}
     distinct_ids: set[int] = set()
-    for row, token_set in enumerate(valid_sets):
+    for row, token_set in enumerate(effective):
+        if row in det_skip:
+            continue
+        if shard is not None and row in masked_full_rows:
+            # Keep the collective balanced even on ranks that own local rows.
+            full_rows.append(row)
+            continue
         if token_set is None or not token_set.ids or len(token_set) > max_rows:
             full_rows.append(row)
             continue
@@ -302,7 +433,7 @@ def build_draft_logits(
         # Bitmask decoding already clips to ``vocab_size`` and returns sorted
         # ids, so the old per-token Python scan was pure overhead on the hot
         # path (up to 32k iterations per row).
-        if ids[-1] >= vocab_size:
+        if ids[-1] >= local_vocab:
             full_rows.append(row)
             continue
         distinct_ids.add(id(token_set))
@@ -366,11 +497,32 @@ def build_draft_logits(
         values = _postprocess(values, scale=scale, soft_cap=soft_cap)
         # Flat index_put is noticeably faster than a 2-D advanced-index write
         # on a [batch, vocab] tensor and avoids a second generic scatter
-        # kernel.
-        flat = (row_index[:, None] * vocab_size + token_index[None, :]).reshape(-1)
+        # kernel. Under TP, ``token_index`` holds local weight rows while the
+        # output must be indexed by global token ids.
+        if shard is None:
+            columns = token_index
+        else:
+            columns = _upload(
+                np.asarray(global_ids[id(token_set)], dtype=np.int64),
+                hidden_states.device,
+            )
+        flat = (row_index[:, None] * vocab_size + columns[None, :]).reshape(-1)
         out.view(-1).index_put_((flat,), values.reshape(-1))
         sliced_rows += len(rows)
         candidate_total += len(ids) * len(rows)
+
+    if det_rows:
+        det_index = _upload(
+            np.asarray([row for row, _ in det_rows], dtype=np.int64),
+            hidden_states.device,
+        )
+        det_token = _upload(
+            np.asarray([token for _, token in det_rows], dtype=np.int64),
+            hidden_states.device,
+        )
+        # ``out`` is already -inf everywhere; one finite column per row makes
+        # the row a one-hot constrained distribution.
+        out[det_index, det_token] = 0.0
 
     if full_rows:
         row_index = _upload(np.asarray(full_rows, dtype=np.int64), hidden_states.device)
@@ -382,6 +534,24 @@ def build_draft_logits(
                 f"full_logits returned shape {tuple(values.shape)}, "
                 f"expected [{len(full_rows)}, >= {vocab_size}]"
             )
+        if masked_full_rows:
+            position = {row: index for index, row in enumerate(full_rows)}
+            for row in sorted(masked_full_rows):
+                index = position.get(row)
+                if index is None:
+                    continue
+                token_set = valid_sets[row]
+                if token_set is None or token_set.is_empty:
+                    continue
+                ids = [token for token in token_set.ids if token < vocab_size]
+                if not ids:
+                    continue
+                # A rank with no local candidate still has an exact V: keep the
+                # full head's values but mask every grammar-invalid column.
+                columns = torch.as_tensor(ids, dtype=torch.long, device=out.device)
+                kept = values[index, columns]
+                values[index] = float("-inf")
+                values[index, columns] = kept
         out[row_index] = values[:, :vocab_size].float()
 
     distinct_sets = len(distinct_ids)
@@ -391,7 +561,13 @@ def build_draft_logits(
         full_rows=len(full_rows),
         candidate_total=candidate_total,
         distinct_sets=distinct_sets,
+        masked_full_rows=len(masked_full_rows),
     )
 
 
-__all__ = ["DraftSliceLogitsStats", "VllmLogitsError", "build_draft_logits"]
+__all__ = [
+    "DraftSliceLogitsStats",
+    "VllmLogitsError",
+    "build_draft_logits",
+    "mask_logits_to_valid",
+]

@@ -13,18 +13,21 @@ from pathlib import Path
 from typing import Any
 
 from .types import (
+    DraftContract,
     Execution,
     Guarantee,
     GuaranteeKind,
     HeadPlan,
     NodePlan,
     PlanCost,
+    ServingPoint,
     StepPlan,
     TokenSet,
 )
 
 PLAN_SCHEMA = "plan/1"
 STEP_PLAN_SCHEMA = "step_plan/1"
+CONTRACT_SCHEMA = "contract/1"
 
 
 class PlanFormatError(ValueError):
@@ -64,6 +67,8 @@ def _guarantee_to_dict(guarantee: Guarantee) -> dict[str, Any]:
         "universe": guarantee.universe,
         "delta": guarantee.delta,
         "calibration_id": guarantee.calibration_id,
+        "scope": guarantee.scope,
+        "fallback_rule": guarantee.fallback_rule,
     }
 
 
@@ -83,6 +88,8 @@ def _guarantee_from_dict(value: Any) -> Guarantee:
             universe=universe,
             delta=value.get("delta"),
             calibration_id=value.get("calibration_id"),
+            scope=value.get("scope", "mu_proj"),
+            fallback_rule=value.get("fallback_rule", "full_head"),
         )
     except ValueError as exc:
         raise PlanFormatError(str(exc)) from exc
@@ -280,10 +287,79 @@ def step_plan_from_dict(value: Any) -> StepPlan:
         raise PlanFormatError(str(exc)) from exc
 
 
+def contract_payload(contract: DraftContract, *, include_id: bool = False) -> dict[str, Any]:
+    """Canonical, JSON-safe representation of a :class:`DraftContract`."""
+
+    def token_set(value: TokenSet | None) -> dict[str, Any] | None:
+        return None if value is None else _token_set_to_dict(value)
+
+    payload: dict[str, Any] = {
+        "schema_version": CONTRACT_SCHEMA,
+        "grammar_state_id": contract.grammar_state_id,
+        "valid_set": token_set(contract.valid_set),
+        "candidate_set": token_set(contract.candidate_set),
+        "mode": contract.mode,
+        "execution": _execution_to_dict(contract.execution),
+        "guarantee": _guarantee_to_dict(contract.guarantee),
+        "serving": contract.serving.to_dict(),
+        "fallback_reason": contract.fallback_reason,
+    }
+    if include_id:
+        payload["contract_id"] = compute_contract_id(contract)
+    return payload
+
+
+def compute_contract_id(contract: DraftContract) -> str:
+    digest = hashlib.sha256(_canonical_json(contract_payload(contract)).encode()).hexdigest()
+    return f"sha256:{digest}"
+
+
+def contract_to_dict(contract: DraftContract) -> dict[str, Any]:
+    return contract_payload(contract, include_id=True)
+
+
+def contract_from_dict(value: Any) -> DraftContract:
+    if not isinstance(value, dict):
+        raise PlanFormatError("contract must be an object")
+    if value.get("schema_version") != CONTRACT_SCHEMA:
+        raise PlanFormatError(
+            f"unsupported contract schema version: {value.get('schema_version')!r}"
+        )
+    serving_value = value.get("serving") or {}
+    if not isinstance(serving_value, dict):
+        raise PlanFormatError("contract.serving must be an object")
+    valid = value.get("valid_set")
+    candidate = value.get("candidate_set")
+    try:
+        return DraftContract(
+            grammar_state_id=value.get("grammar_state_id"),
+            valid_set=None if valid is None else _token_set_from_dict(valid),
+            candidate_set=None if candidate is None else _token_set_from_dict(candidate),
+            mode=value.get("mode"),
+            execution=_execution_from_dict(value.get("execution")),
+            guarantee=_guarantee_from_dict(value.get("guarantee")),
+            serving=ServingPoint(
+                k=int(serving_value.get("k", 0)),
+                source=str(serving_value.get("source", "builtin")),
+                expected_tau=serving_value.get("expected_tau"),
+                target_metric=str(serving_value.get("target_metric", "throughput")),
+                head_share=serving_value.get("head_share"),
+            ),
+            fallback_reason=value.get("fallback_reason"),
+        )
+    except (ValueError, TypeError) as exc:
+        raise PlanFormatError(str(exc)) from exc
+
+
 __all__ = [
+    "CONTRACT_SCHEMA",
     "PLAN_SCHEMA",
     "STEP_PLAN_SCHEMA",
     "PlanFormatError",
+    "compute_contract_id",
+    "contract_from_dict",
+    "contract_payload",
+    "contract_to_dict",
     "compute_plan_id",
     "compute_step_plan_id",
     "dumps",

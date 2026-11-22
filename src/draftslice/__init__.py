@@ -6,11 +6,13 @@ Public interfaces live under ``draftslice.plan``, ``draftslice.constraints``,
 """
 
 from .plan import (
+    DraftContract,
     Execution,
     Guarantee,
     GuaranteeKind,
     HeadPlan,
     PlanCost,
+    ServingPoint,
     Slice,
     StepPlan,
     TokenSet,
@@ -19,11 +21,13 @@ from .plan import (
 __version__ = "0.0.1"
 
 __all__ = [
+    "DraftContract",
     "Execution",
     "Guarantee",
     "GuaranteeKind",
     "HeadPlan",
     "PlanCost",
+    "ServingPoint",
     "Slice",
     "StepPlan",
     "TokenSet",

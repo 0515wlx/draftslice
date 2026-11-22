@@ -7,8 +7,12 @@ This is a strict-mode first integration:
 - draft step 0 slices the draft LM head to the grammar-valid rows;
 - an opt-in registry screener can further narrow those rows with constrained
   ``A := A ∩ V`` semantics (the target verifier still enforces the grammar);
-- later draft steps, TP > 1, quantized heads, and unsupported dtypes fall back
-  to the full draft head.
+- later draft steps, quantized heads, and unsupported dtypes fall back to the
+  full draft head;
+- TP>1 slices each rank's contiguous vocab shard and scatters the logits back to
+  global token-id columns; a rank whose valid set has no local token uses the
+  full head masked to V;
+- every decision emits a ``DraftContract`` with the fail-closed reason.
 
 The integration is registered through the ``vllm.general_plugins`` entry point.
 It deliberately does not import vLLM from the core package.
@@ -25,13 +29,30 @@ from typing import Any
 
 import numpy as np
 
-from ..plan.types import TokenSet
+from ..plan.types import (
+    DraftContract,
+    Execution,
+    Guarantee,
+    ServingPoint,
+    TokenSet,
+)
+from .head_shard import HeadShard
+from .quant_dequant import (
+    dequantize_rows,
+    describe_quantized_head,
+    is_quantized_weight,
+)
+from .vllm_fastmask import apply_packed_mask
 from .vllm_grammar import (
     GrammarSnapshot,
     current_grammar_snapshot,
     install_grammar_bridge,
 )
-from .vllm_logits import build_draft_logits
+from .vllm_logits import (
+    build_draft_logits,
+    mask_logits_to_valid,
+    upload_numpy,
+)
 
 _REGISTERED = False
 _SHADOW_PATCHED = False
@@ -58,6 +79,8 @@ class DraftSliceVllmStats:
     propose_calls: int = 0
     propose_shadow_calls: int = 0
     graph_replay_calls: int = 0
+    graph_mask_calls: int = 0
+    full_mask_calls: int = 0
     screener_name: str | None = None
     screener_universe: str | None = None
     screener_calibration_id: str | None = None
@@ -68,10 +91,31 @@ class DraftSliceVllmStats:
     screener_empty_rows: int = 0
     screener_freeform_rows: int = 0
     block_step0_rows: int = 0
+    block_allpos_rows: int = 0
+    block_allpos_requests: int = 0
+    block_allpos_fallbacks: int = 0
+    routed_full_steps: int = 0
+    routed_slice_steps: int = 0
+    routed_full_calls: int = 0
+    deterministic_rows: int = 0
     screener_errors: int = 0
     mask_stride: int = 0
     last_error: str | None = None
     errors: list[str] = field(default_factory=list)
+    # Fail-closed observability: a histogram of why a step did not slice, plus
+    # the last concrete DraftContract emitted by this speculator.
+    fallback_reasons: dict[str, int] = field(default_factory=dict)
+    last_contract: dict[str, Any] | None = None
+    tp_size: int = 1
+    tp_rank: int = 0
+    tp_shard_rows: int = 0
+    quantized_head: bool = False
+    quantized_rows: int = 0
+
+    def note_fallback(self, reason: str) -> None:
+        """Record a fail-closed decision without flooding the error list."""
+
+        self.fallback_reasons[reason] = self.fallback_reasons.get(reason, 0) + 1
 
     def record(self, *, sliced: bool, stats: Any = None) -> None:
         self.calls += 1
@@ -104,6 +148,8 @@ class DraftSliceVllmStats:
             "propose_calls": self.propose_calls,
             "propose_shadow_calls": self.propose_shadow_calls,
             "graph_replay_calls": self.graph_replay_calls,
+            "graph_mask_calls": self.graph_mask_calls,
+            "full_mask_calls": self.full_mask_calls,
             "screener_name": self.screener_name,
             "screener_universe": self.screener_universe,
             "screener_calibration_id": self.screener_calibration_id,
@@ -114,8 +160,22 @@ class DraftSliceVllmStats:
             "screener_empty_rows": self.screener_empty_rows,
             "screener_freeform_rows": self.screener_freeform_rows,
             "block_step0_rows": self.block_step0_rows,
+            "block_allpos_rows": self.block_allpos_rows,
+            "block_allpos_requests": self.block_allpos_requests,
+            "block_allpos_fallbacks": self.block_allpos_fallbacks,
+            "routed_full_steps": self.routed_full_steps,
+            "routed_slice_steps": self.routed_slice_steps,
+            "routed_full_calls": self.routed_full_calls,
+            "deterministic_rows": self.deterministic_rows,
             "screener_errors": self.screener_errors,
             "mask_stride": self.mask_stride,
+            "fallback_reasons": dict(self.fallback_reasons),
+            "last_contract": self.last_contract,
+            "tp_size": self.tp_size,
+            "tp_rank": self.tp_rank,
+            "tp_shard_rows": self.tp_shard_rows,
+            "quantized_head": self.quantized_head,
+            "quantized_rows": self.quantized_rows,
             "last_error": self.last_error,
             "errors": list(self.errors),
         }
@@ -136,6 +196,101 @@ def _slicing_enabled() -> bool:
     """
 
     return os.environ.get("DRAFTSLICE_VLLM_SLICE", "0") in ("1", "true", "True")
+
+
+def _full_mask_enabled() -> bool:
+    """Diagnostic control: full head + exact grammar mask, no slicing.
+
+    This is used by the benefit-isolation experiments. It keeps the same worker
+    shadow and candidate sets as the slice path, so the only difference is
+    whether the draft head scores all vocabulary rows or only valid rows.
+    """
+
+    return os.environ.get("DRAFTSLICE_VLLM_FULL_MASK", "0") in ("1", "true", "True")
+
+
+def _router_enabled() -> bool:
+    """Opt-in workload router: skip the slice bookkeeping on free-form batches.
+
+    A batch with no structural request can never use a grammar valid set, so the
+    wrapper's shadow capture, per-step mapping, and logits checks are pure
+    overhead. When enabled, those batches take the stock speculator path.
+    """
+
+    return os.environ.get("DRAFTSLICE_VLLM_ROUTER", "0") in ("1", "true", "True")
+
+
+def _block_allpos_enabled() -> bool:
+    """Opt-in DFlash all-position grammar masking.
+
+    DFlash proposes a whole block in one forward. Only block position 0 has an
+    exact state before sampling today; positions > 0 are left on the full head.
+    Under greedy sampling the next token is the argmax, so the block can be
+    masked sequentially: read position ``p``'s exact set, mask, take its argmax,
+    fork the matcher, then move to ``p+1``. The engine samples from the masked
+    logits afterwards and reproduces the same argmaxes.
+    """
+
+    return os.environ.get("DRAFTSLICE_VLLM_BLOCK_ALLPOS", "0") in ("1", "true", "True")
+
+
+def _block_allpos_depth() -> int | None:
+    """Optional cap on how many block positions get an exact grammar mask.
+
+    Cost scales with ``batch * depth`` because each position needs a grammar
+    bitmask and an argmax to reach the next state. Positions past the cap stay
+    on the full head (a safe fallback).
+    """
+
+    raw = os.environ.get("DRAFTSLICE_VLLM_BLOCK_ALLPOS_DEPTH", "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return max(1, value)
+
+
+def _block_allpos_fast() -> bool:
+    """Use one packed bitmask upload and one fused Triton launch per position."""
+
+    return os.environ.get("DRAFTSLICE_VLLM_BLOCK_ALLPOS_FAST", "0") in (
+        "1",
+        "true",
+        "True",
+    )
+
+
+def _deterministic_injection_enabled() -> bool:
+    """Skip the draft head for rows whose exact valid set has one token."""
+
+    return os.environ.get("DRAFTSLICE_VLLM_DETERMINISTIC", "0") in (
+        "1",
+        "true",
+        "True",
+    )
+
+
+def _block_allpos_max_batch() -> int:
+    """Batch ceiling for all-position masking.
+
+    Measured on A100/Qwen3.5-DFlash: all-position masking wins at B=1 (tau
+    2.67->5.1, +23% tok/s) but loses at B>=8 because the per-position grammar
+    masks and argmaxes cost more than the extra acceptance earns. Larger
+    batches fall back to the position-0 slice, which is the better high-batch
+    point.
+    """
+
+    raw = os.environ.get("DRAFTSLICE_VLLM_BLOCK_ALLPOS_MAX_BATCH", "").strip()
+    if not raw:
+        return 1
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 1
+
+
 
 
 def _decode_uses_full_cudagraph(vllm_config: Any) -> bool:
@@ -302,6 +457,22 @@ class DraftSliceSpeculatorMixin:
     """
 
     _draftslice_allow_slicing = True
+    _draftslice_route_full = False
+    # Class-level defaults keep tests that construct via ``__new__`` safe.
+    _draftslice_shard: HeadShard | None = None
+    _draftslice_head_key: tuple[Any, ...] | None = None
+    _draftslice_head_cache: tuple[Any, HeadShard] | None = None
+    _draftslice_screener: Any | None = None
+    _draftslice_screener_config: ScreenerConfig | None = None
+    _draftslice_idx_mapping_np: np.ndarray | None = None
+    _draftslice_local_argmax: bool = False
+    _draftslice_graph_replay: bool = False
+    _draftslice_graph_packed: Any | None = None
+    _draftslice_graph_rows: Any | None = None
+    _draftslice_graph_vocab: int = 0
+    _draftslice_quant_head: Any | None = None
+    _draftslice_dequant_weight: Any | None = None
+    _draftslice_dequant_filled: set[int] = field(default_factory=set)
     # DFlash gets logits for a whole parallel block in one call. Only block
     # position 0 has an exact grammar state before sampling; later positions
     # must stay on the full head.
@@ -318,10 +489,16 @@ class DraftSliceSpeculatorMixin:
             getattr(self, "vllm_config", None)
         )
         if self._draftslice_graph_replay:
-            # CUDA-graph replay skips the Python draft hooks entirely. Emitting
-            # sliced logits once during capture would freeze a stale candidate
-            # set into the graph, so keep the full head as the only safe path.
-            self._disable_graph_slicing()
+            # Freezing candidate ids into the graph would make them stale. Use a
+            # static packed bitmask instead: it is refreshed before every replay
+            # and applied by the same captured Triton kernel.
+            self._init_graph_mask()
+        self._draftslice_local_argmax = bool(
+            getattr(self, "use_local_argmax_reduction", False)
+        )
+        self._draftslice_shard: HeadShard | None = None
+        self._draftslice_head_key: tuple[Any, ...] | None = None
+        self._draftslice_head_cache: tuple[Any, HeadShard] | None = None
         self._draftslice_snapshot: GrammarSnapshot | None = None
         self._draftslice_input_batch: Any | None = None
         self._draftslice_idx_mapping: Any | None = None
@@ -338,6 +515,7 @@ class DraftSliceSpeculatorMixin:
         self._draftslice_screener_config: ScreenerConfig | None = None
         self._draftslice_screener_ready = False
         self._draftslice_draft_step: Any | None = None
+        self._draftslice_route_full = False
 
         if os.environ.get("DRAFTSLICE_VLLM_DEBUG") == "1":
             import sys
@@ -352,6 +530,105 @@ class DraftSliceSpeculatorMixin:
 
     def draftslice_stats(self) -> dict[str, Any]:
         return self._draftslice_stats.to_dict()
+
+    @staticmethod
+    def _union_token_sets(valid_sets: Any) -> TokenSet | None:
+        ids: set[int] = set()
+        for token_set in valid_sets or ():
+            if token_set is not None:
+                ids.update(token_set.ids)
+        return TokenSet(ids) if ids else None
+
+    def _grammar_state_id(self) -> str | None:
+        mapping = self._draftslice_idx_mapping_np
+        if mapping is None or len(mapping) == 0:
+            return None
+        try:
+            return str(int(mapping[0]))
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            return None
+
+    def _emit_contract(
+        self,
+        *,
+        mode: str,
+        valid_sets: Any = None,
+        reason: str | None = None,
+        logits_stats: Any = None,
+        vocab_size: int = 0,
+        execution_kind: str | None = None,
+    ) -> None:
+        """Make the current step's contract concrete and observable."""
+
+        valid = self._union_token_sets(valid_sets)
+        screener_active = (
+            self._draftslice_screener is not None
+            and self._draftslice_screener_config is not None
+        )
+        if mode == "full":
+            guarantee = Guarantee.full()
+            execution = Execution(kind="full")
+            candidate_set = None
+            head_share = None
+        else:
+            if screener_active:
+                config = self._draftslice_screener_config
+                guarantee = Guarantee.calibrated(
+                    config.delta if config.delta is not None else 0.05,
+                    universe="valid",
+                    calibration_id=config.calibration_id,
+                )
+            elif mode == "mask_allpos":
+                guarantee = Guarantee.exact_valid_set()
+            else:
+                guarantee = Guarantee.exact_valid_set()
+            candidate_set = valid
+            rows = int(getattr(logits_stats, "rows", 0))
+            candidates = int(getattr(logits_stats, "candidate_total", 0))
+            head_share = candidates / (rows * vocab_size) if rows and vocab_size else None
+            execution = Execution(
+                kind=execution_kind
+                or ("slice_gemm" if self._draftslice_shard is not None else "slice_gemv"),
+                rows=candidate_set,
+            )
+        source = "draftslice"
+        if self._draftslice_shard is not None and self._draftslice_shard.tp_size > 1:
+            source = f"draftslice_tp{self._draftslice_shard.tp_size}"
+        elif screener_active:
+            source = f"draftslice+{self._draftslice_screener_config.name}"
+        contract = DraftContract(
+            grammar_state_id=self._grammar_state_id(),
+            valid_set=valid,
+            candidate_set=candidate_set,
+            mode=mode,
+            execution=execution,
+            guarantee=guarantee,
+            serving=ServingPoint(
+                k=int(getattr(self, "num_speculative_steps", 0) or 0),
+                source=source,
+                target_metric="throughput",
+                head_share=head_share,
+            ),
+            fallback_reason=reason,
+        )
+        self._draftslice_stats.last_contract = contract.to_dict()
+        if reason is not None:
+            self._draftslice_stats.note_fallback(reason)
+
+    def _fallback(
+        self,
+        reason: str | None,
+        *,
+        valid_sets: Any = None,
+        base_compute: Any,
+        hidden_states: Any,
+        spec_step_idx: int,
+    ) -> Any:
+        """Fail closed to the full head and record the exact reason."""
+
+        self._draftslice_stats.record(sliced=False)
+        self._emit_contract(mode="full", valid_sets=valid_sets, reason=reason)
+        return base_compute(hidden_states, spec_step_idx)
 
     def _maybe_debug_stats(self) -> None:
         if os.environ.get("DRAFTSLICE_VLLM_DEBUG") != "1":
@@ -369,10 +646,74 @@ class DraftSliceSpeculatorMixin:
             }
         print(f"[draftslice] {stats}", file=sys.stderr, flush=True)
 
-    def _disable_graph_slicing(self) -> None:
+    def _init_graph_mask(self) -> None:
+        """Allocate the static packed bitmask read by the captured graph."""
+
+        try:
+            import torch
+
+            vocab = int(getattr(self, "vocab_size", 0) or 0)
+            max_rows = int(getattr(self, "max_num_reqs", 0) or 0)
+            if vocab <= 0 or max_rows <= 0:
+                raise ValueError("missing vocab_size/max_num_reqs")
+            device = getattr(self, "device", None) or torch.device("cuda")
+            words = (vocab + 31) // 32
+            self._draftslice_graph_vocab = vocab
+            self._draftslice_graph_packed = torch.full(
+                (max_rows, words), -1, dtype=torch.int32, device=device
+            )
+            self._draftslice_graph_rows = torch.arange(
+                max_rows, dtype=torch.int64, device=device
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            self._draftslice_slicing = False
+            self._draftslice_stats.note_fallback("graph_mask_unavailable")
+            self._draftslice_stats.record_error(f"graph mask init: {exc}")
+
+    def _prepare_graph_mask(self, input_batch: Any) -> None:
+        """Refresh the static bitmask from the exact step-0 shadow sets."""
+
+        packed_buf = self._draftslice_graph_packed
+        if packed_buf is None or input_batch is None:
+            return
+        shadow = self._draftslice_shadow
+        if shadow is None or not shadow.entries:
+            return
+        mapping = getattr(input_batch, "idx_mapping_np", None)
+        if mapping is None:
+            return
+        try:
+            import torch
+
+            packed_buf.fill_(-1)
+            handles: dict[int, Any] = {}
+            states = np.asarray(mapping).reshape(-1)
+            for row, state in enumerate(states[: packed_buf.shape[0]]):
+                state = int(state)
+                if state < 0 or not shadow.has(state):
+                    continue
+                handle = shadow.begin_block(state)
+                if handle is not None:
+                    handles[row] = handle
+            if handles:
+                sub = shadow.batch_block_masks(
+                    handles,
+                    vocab_size=self._draftslice_graph_vocab,
+                    device=packed_buf.device,
+                )
+                if sub is not None:
+                    rows = torch.tensor(
+                        sorted(handles), dtype=torch.int64, device=packed_buf.device
+                    )
+                    packed_buf[rows] = sub.reshape(len(handles), -1)
+        except Exception as exc:  # pragma: no cover - defensive
+            self._draftslice_stats.record_error(f"graph mask refresh: {exc}")
+
+    def _disable_graph_slicing(self, *, reason: str = "full_cuda_graph") -> None:
         if not self._draftslice_slicing:
             return
         self._draftslice_slicing = False
+        self._draftslice_stats.note_fallback(reason)
         if os.environ.get("DRAFTSLICE_VLLM_DEBUG") == "1":
             import sys
 
@@ -388,11 +729,20 @@ class DraftSliceSpeculatorMixin:
         # mode, a non-None decode graph manager still means FULL decode replay.
         if getattr(self, "decode_cudagraph_manager", None) is not None:
             self._draftslice_graph_replay = True
-            self._disable_graph_slicing()
+            if self._draftslice_graph_packed is None:
+                self._init_graph_mask()
+            else:
+                self._draftslice_graph_packed.fill_(-1)
         return super().capture()
 
     def reset_state(self) -> None:
         self._draftslice_stats = DraftSliceVllmStats()
+        self._draftslice_shard = None
+        self._draftslice_head_key = None
+        self._draftslice_head_cache = None
+        self._draftslice_quant_head = None
+        self._draftslice_dequant_weight = None
+        self._draftslice_dequant_filled = set()
         self._draftslice_snapshot = None
         self._draftslice_input_batch = None
         self._draftslice_idx_mapping = None
@@ -402,6 +752,7 @@ class DraftSliceSpeculatorMixin:
         self._draftslice_call_index = 0
         self._draftslice_req_by_state = {}
         self._draftslice_draft_step = None
+        self._draftslice_route_full = False
         if self._draftslice_shadow is not None:
             self._draftslice_shadow.clear()
         return super().reset_state()
@@ -426,6 +777,8 @@ class DraftSliceSpeculatorMixin:
             except Exception as exc:  # pragma: no cover - defensive
                 self._draftslice_stats.record_error(f"shadow init: {exc}")
                 return
+            if not self._draftslice_shadow.enabled:
+                self._draftslice_stats.note_fallback("shadow_disabled")
         try:
             self._draftslice_shadow.register(int(req_index), sampling_params)
         except Exception as exc:  # pragma: no cover - defensive
@@ -464,13 +817,50 @@ class DraftSliceSpeculatorMixin:
             self._draftslice_shadow.drop(finished_req_ids)
         return super().on_requests_finished(finished_req_ids)
 
+    def _batch_has_grammar(self, input_batch: Any) -> bool:
+        """Cheap router predicate: does this step contain any grammar state?"""
+
+        snapshot = current_grammar_snapshot()
+        shadow = self._draftslice_shadow
+        try:
+            idx_np = getattr(input_batch, "idx_mapping_np", None)
+            states = None if idx_np is None else np.asarray(idx_np).reshape(-1)
+        except Exception:  # pragma: no cover - defensive
+            return True
+        if shadow is not None and shadow.entries:
+            if states is None:
+                return True
+            if any(int(state) in shadow.entries for state in states):
+                return True
+        if snapshot is not None and snapshot.structured_req_ids:
+            # vLLM captures a snapshot even for an all-free-form step, with an
+            # empty structured set. Only a structured row counts as grammar.
+            req_ids = set(getattr(input_batch, "req_ids", ()) or ())
+            if not req_ids:
+                return True
+            return any(req_id in req_ids for req_id in snapshot.structured_req_ids)
+        return False
+
     def propose(self, *args: Any, **kwargs: Any) -> Any:
         if not self._draftslice_slicing:
             return super().propose(*args, **kwargs)
         self._draftslice_stats.propose_calls += 1
+        input_batch = args[0] if args else kwargs.get("input_batch")
+        if self._draftslice_graph_replay:
+            self._prepare_graph_mask(input_batch)
+        if _router_enabled() and input_batch is not None:
+            if not self._batch_has_grammar(input_batch):
+                # No row can use a valid set: take the stock path without
+                # shadow/mapping/logits bookkeeping.
+                self._draftslice_route_full = True
+                self._draftslice_stats.routed_full_steps += 1
+                self._draftslice_input_batch = None
+                self._draftslice_snapshot = None
+                return super().propose(*args, **kwargs)
+        self._draftslice_route_full = False
+        self._draftslice_stats.routed_slice_steps += 1
         if self._draftslice_shadow is not None and self._draftslice_shadow.entries:
             self._draftslice_stats.propose_shadow_calls += 1
-        input_batch = args[0] if args else kwargs.get("input_batch")
         self._draftslice_dummy = bool(kwargs.get("dummy_run", False))
         self._draftslice_input_batch = input_batch
         self._draftslice_snapshot = current_grammar_snapshot()
@@ -537,6 +927,18 @@ class DraftSliceSpeculatorMixin:
                 spec_step_idx=spec_step_idx,
                 num_steps=num_steps,
             )
+        if self._draftslice_route_full:
+            return super().sample_draft(
+                hidden_states,
+                sample_src_positions,
+                idx_mapping,
+                temperature,
+                seeds,
+                draft_step,
+                draft_logits,
+                spec_step_idx=spec_step_idx,
+                num_steps=num_steps,
+            )
         self._draftslice_idx_mapping = idx_mapping
         self._draftslice_draft_step = draft_step
         # MTP/EAGLE in this engine calls sample_draft without spec_step_idx for
@@ -563,6 +965,7 @@ class DraftSliceSpeculatorMixin:
         if (
             self._draftslice_shadow is not None
             and not self._draftslice_dummy
+            and not self._draftslice_graph_replay
             and not self._draftslice_block
             and self._draftslice_step + 1
             < int(getattr(self, "num_speculative_steps", num_steps))
@@ -809,30 +1212,124 @@ class DraftSliceSpeculatorMixin:
         return result.sets
 
     def _lm_head_weight(self) -> Any | None:
+        """Return the local, unquantized, CUDA LM-head weight or ``None``."""
+
         model = getattr(self, "model", None)
-        if model is None:
-            return None
-        lm_head = getattr(model, "lm_head", None)
+        lm_head = getattr(model, "lm_head", None) if model is not None else None
         if lm_head is None:
+            self._draftslice_stats.note_fallback("no_lm_head")
             return None
         try:
             import torch
         except ImportError:  # pragma: no cover - vLLM requires torch
             return None
-        if getattr(lm_head, "tp_size", 1) != 1:
-            return None
-        if getattr(lm_head, "quant_config", None) is not None:
-            return None
         weight = getattr(lm_head, "weight", None)
         if weight is None or weight.device.type != "cuda":
+            self._draftslice_stats.note_fallback("no_cuda_weight")
             return None
-        if weight.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+        if weight.dtype not in (
+            torch.bfloat16,
+            torch.float16,
+            torch.float32,
+        ) and not is_quantized_weight(weight):
+            self._draftslice_stats.note_fallback("unsupported_dtype")
             return None
-        key = (weight.data_ptr(), weight.dtype, tuple(weight.shape))
-        if self._draftslice_weight is None or self._draftslice_weight_key != key:
-            self._draftslice_weight = weight
-            self._draftslice_weight_key = key
-        return self._draftslice_weight
+        return weight
+
+    def _slice_head(self) -> tuple[Any, HeadShard] | None:
+        """Return the sliceable local ``(weight, shard)`` or fail closed.
+
+        TP>1 is supported by slicing each rank's contiguous vocab row shard and
+        scattering the result back to global token-id columns. Any condition we
+        cannot prove safe returns ``None`` and records a fallback reason.
+        """
+
+        weight = self._lm_head_weight()
+        if weight is None:
+            return None
+        lm_head = getattr(getattr(self, "model", None), "lm_head", None)
+        if is_quantized_weight(weight):
+            quant_head = describe_quantized_head(lm_head, weight)
+            if quant_head is None:
+                self._draftslice_stats.note_fallback("unsupported_quant_scheme")
+                return None
+            self._draftslice_quant_head = quant_head
+            self._draftslice_stats.quantized_head = True
+        else:
+            self._draftslice_quant_head = None
+        try:
+            vocab_size = int(getattr(self, "vocab_size", 0) or 0)
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            vocab_size = 0
+        shard = HeadShard.from_lm_head(
+            lm_head,
+            weight_rows=int(weight.shape[0]),
+            vocab_size=vocab_size,
+        )
+        if shard is None:
+            self._draftslice_stats.note_fallback("unsupported_head_layout")
+            return None
+        self._draftslice_shard = shard
+        self._draftslice_stats.tp_size = shard.tp_size
+        self._draftslice_stats.tp_rank = shard.tp_rank
+        self._draftslice_stats.tp_shard_rows = shard.shard_rows
+        key = (weight.data_ptr(), weight.dtype, tuple(weight.shape), shard)
+        if self._draftslice_head_key == key and self._draftslice_head_cache is not None:
+            return self._draftslice_head_cache
+        self._draftslice_head_key = key
+        self._draftslice_head_cache = (weight, shard)
+        return weight, shard
+
+    def _prepare_weight(
+        self,
+        weight: Any,
+        valid_sets: Any,
+        shard: HeadShard | None,
+        local_vocab: int,
+        vocab_size: int,
+    ) -> Any:
+        """Materialize the candidate weight rows (dequantizing if needed)."""
+
+        quant_head = self._draftslice_quant_head
+        if quant_head is None:
+            return weight if shard is not None else weight[:local_vocab]
+
+        import torch
+
+        rows: set[int] = set()
+        for token_set in valid_sets or ():
+            if token_set is None:
+                continue
+            for token in token_set.ids:
+                if token >= vocab_size:
+                    continue
+                row = token if shard is None else shard.local_row(token)
+                if row is not None and 0 <= row < local_vocab:
+                    rows.add(int(row))
+        buffer = self._draftslice_dequant_weight
+        if (
+            buffer is None
+            or buffer.shape[0] != local_vocab
+            or buffer.shape[1] != quant_head.in_features
+        ):
+            buffer = torch.zeros(
+                (local_vocab, quant_head.in_features),
+                dtype=quant_head.out_dtype,
+                device=weight.device,
+            )
+            self._draftslice_dequant_weight = buffer
+            self._draftslice_dequant_filled = set()
+        pending = sorted(rows - self._draftslice_dequant_filled)
+        if pending:
+            values = dequantize_rows(quant_head, pending)
+            if values is None:
+                self._draftslice_stats.note_fallback("unsupported_quant_scheme")
+                return None
+            with torch.no_grad():
+                buffer[pending] = values
+            self._draftslice_dequant_filled.update(pending)
+            self._draftslice_stats.quantized_rows += len(pending)
+        return buffer
 
     def _logits_postprocess(self) -> tuple[float, float | None, bool]:
         processor = getattr(getattr(self, "model", None), "logits_processor", None)
@@ -844,24 +1341,271 @@ class DraftSliceSpeculatorMixin:
         soft_cap = getattr(processor, "soft_cap", None)
         return scale, soft_cap, True
 
+    def _compute_block_allpos(
+        self,
+        hidden_states: Any,
+        spec_step_idx: int,
+        base_compute: Any,
+    ) -> Any | None:
+        """DFlash: mask every block position with its own exact grammar set.
+
+        This is a *mask-only* path: the full block head is computed once, then
+        each position is masked in sequence. Greedy sampling makes the next
+        token the argmax of the masked row, so that argmax can advance a forked
+        matcher to build the next position's set before the engine samples.
+
+        Returns ``None`` when the shape, the state mapping, or the sampling mode
+        is unsupported; the caller then uses the ordinary (position-0) path.
+        """
+
+        shadow = self._draftslice_shadow
+        mapping = self._draftslice_idx_mapping
+        if shadow is None or mapping is None or not shadow.entries:
+            self._draftslice_stats.block_allpos_fallbacks += 1
+            return None
+        rows = int(hidden_states.shape[0])
+        steps = int(getattr(self, "num_speculative_steps", 1) or 1)
+        if steps <= 1 or rows <= 0 or rows % steps:
+            self._draftslice_stats.block_allpos_fallbacks += 1
+            return None
+        if rows // steps > _block_allpos_max_batch():
+            self._draftslice_stats.block_allpos_fallbacks += 1
+            return None
+        try:
+            state_rows = [int(x) for x in mapping[:rows].reshape(-1).tolist()]
+            step_tensor = self._draftslice_draft_step
+            if step_tensor is not None:
+                step_rows = [int(x) for x in step_tensor[:rows].reshape(-1).tolist()]
+            else:
+                step_rows = [index % steps for index in range(rows)]
+        except Exception as exc:  # pragma: no cover - defensive
+            self._draftslice_stats.record_error(f"block allpos mapping: {exc}")
+            self._draftslice_stats.block_allpos_fallbacks += 1
+            return None
+        temperature = getattr(self, "temperature", None)
+        if temperature is not None:
+            try:
+                involved = sorted({state for state in state_rows if state >= 0})
+                if involved and float(temperature[involved].max()) != 0.0:
+                    # Sampling with temperature would not reproduce the argmax
+                    # used to advance the grammar, so keep the exact fallback.
+                    self._draftslice_stats.block_allpos_fallbacks += 1
+                    return None
+            except Exception:  # pragma: no cover - defensive
+                self._draftslice_stats.block_allpos_fallbacks += 1
+                return None
+
+        logits = base_compute(hidden_states, spec_step_idx)
+        if logits.ndim != 2 or int(logits.shape[0]) != rows:
+            self._draftslice_stats.block_allpos_fallbacks += 1
+            return None
+
+        groups = rows // steps
+        # Position-major, batched state advance: one grammar mask per
+        # (request, position), but only one argmax sync per position. The
+        # per-row version serialized B*k argmaxes and stalled the stream.
+        work: dict[int, Any] = {}
+        for req in range(groups):
+            base = req * steps
+            state = state_rows[base]
+            if state < 0 or not shadow.has(state):
+                continue
+            if step_rows[base : base + steps] != list(range(steps)):
+                continue
+            handle = shadow.begin_block(state)
+            if handle is not None:
+                work[req] = handle
+        if not work:
+            self._draftslice_stats.block_allpos_fallbacks += 1
+            return None
+
+        depth = _block_allpos_depth()
+        limit = steps if depth is None else min(steps, depth)
+        view = logits.view(groups, steps, -1)
+        masked_rows = 0
+        fast = _block_allpos_fast()
+        vocab = int(logits.shape[1])
+        try:
+            import torch
+
+            for position in range(limit):
+                if fast:
+                    from .vllm_fastmask import apply_packed_mask
+
+                    packed = shadow.batch_block_masks(
+                        work, vocab_size=vocab, device=logits.device
+                    )
+                    if packed is None:
+                        break
+                    reqs = list(work.keys())
+                    rows = upload_numpy(
+                        np.asarray(reqs, dtype=np.int32), logits.device
+                    )
+                    apply_packed_mask(
+                        logits,
+                        base=position * vocab,
+                        row_stride=steps * vocab,
+                        packed=packed,
+                        rows=rows,
+                        vocab_size=vocab,
+                    )
+                    masked_rows += len(reqs)
+                    target = view[:, position, :]
+                    tokens = target.argmax(dim=-1).tolist()
+                    for req in reqs:
+                        if not shadow.block_advance(work[req], int(tokens[req])):
+                            work.pop(req, None)
+                    continue
+
+                active: list[int] = []
+                masks: list[Any] = []
+                for req, handle in work.items():
+                    mask = shadow.block_mask(
+                        handle,
+                        vocab_size=vocab,
+                        device=logits.device,
+                    )
+                    if mask is None:
+                        continue
+                    active.append(req)
+                    masks.append(mask)
+                if not active:
+                    break
+                target = view[:, position, :]
+                if len(active) == groups:
+                    target.masked_fill_(~torch.stack(masks), float("-inf"))
+                else:
+                    for req, mask in zip(active, masks, strict=True):
+                        target[req].masked_fill_(~mask, float("-inf"))
+                tokens = target[active].argmax(dim=-1).tolist()
+                masked_rows += len(active)
+                for req, token in zip(active, tokens, strict=True):
+                    if not shadow.block_advance(work[req], int(token)):
+                        work.pop(req, None)
+        except Exception as exc:  # pragma: no cover - defensive
+            if os.environ.get("DRAFTSLICE_VLLM_DEBUG") == "1":
+                import traceback
+
+                traceback.print_exc()
+            self._draftslice_stats.record_error(f"block allpos: {exc}")
+            self._draftslice_stats.block_allpos_fallbacks += 1
+            return None
+
+        self._draftslice_stats.block_allpos_rows += masked_rows
+        self._draftslice_stats.block_allpos_requests += groups
+        self._draftslice_stats.calls += 1
+        self._draftslice_stats.sliced_calls += 1
+        return logits
+
+    def get_draft_top_tokens(self, hidden_states: Any, spec_step_idx: int = 0) -> Any:
+        """Greedy ids from the sliced head when local-argmax reduction is on.
+
+        vLLM's ``sample_draft`` bypasses ``compute_draft_logits`` in this mode
+        and calls this hook directly. We reuse the sliced path to produce
+        ``[batch, vocab]`` logits (and its contract/fallback stats), then apply
+        the same ``(value, id)`` TP reduction vLLM uses in
+        ``LogitsProcessor.get_top_tokens``.
+        """
+
+        base = super().get_draft_top_tokens
+        if not (
+            self._draftslice_enabled
+            and self._draftslice_slicing
+            and self._draftslice_local_argmax
+        ):
+            try:
+                return base(hidden_states, spec_step_idx)
+            except TypeError:  # pragma: no cover - single-arg model hooks
+                return base(hidden_states)
+
+        import torch
+
+        logits = self.compute_draft_logits(hidden_states, spec_step_idx)
+        values, ids = logits.max(dim=-1)
+        shard = self._draftslice_shard
+        if shard is not None and shard.tp_size > 1:
+            try:
+                from vllm.distributed.parallel_state import (
+                    tensor_model_parallel_all_gather,
+                )
+
+                pairs = torch.stack((values.float(), ids.float()), dim=-1)
+                gathered = tensor_model_parallel_all_gather(pairs, dim=-1)
+                gathered = gathered.view(logits.shape[0], shard.tp_size, 2)
+                best = gathered[..., 0].argmax(dim=-1)
+                rows = torch.arange(logits.shape[0], device=logits.device)
+                ids = gathered[rows, best, 1]
+            except Exception as exc:  # pragma: no cover - defensive
+                self._draftslice_stats.record_error(f"local argmax reduce: {exc}")
+        ids = ids.to(torch.int64)
+        draft_to_target = getattr(
+            getattr(self, "model", None), "draft_id_to_target_id", None
+        )
+        if draft_to_target is not None:
+            ids = ids + draft_to_target[ids]
+        return ids
+
     def compute_draft_logits(self, hidden_states: Any, spec_step_idx: int) -> Any:
         base_compute = super().compute_draft_logits
+
+        def fallback(reason: str | None, valid_sets: Any = None) -> Any:
+            return self._fallback(
+                reason,
+                valid_sets=valid_sets,
+                base_compute=base_compute,
+                hidden_states=hidden_states,
+                spec_step_idx=spec_step_idx,
+            )
+
+        if self._draftslice_graph_replay and self._draftslice_slicing:
+            logits = base_compute(hidden_states, spec_step_idx)
+            vocab = min(self._draftslice_graph_vocab or int(logits.shape[1]), int(logits.shape[1]))
+            if self._draftslice_spec_step == 0 and self._draftslice_graph_packed is not None:
+                rows = min(hidden_states.shape[0], self._draftslice_graph_packed.shape[0])
+                apply_packed_mask(
+                    logits,
+                    base=0,
+                    row_stride=int(logits.shape[1]),
+                    packed=self._draftslice_graph_packed[:rows],
+                    rows=self._draftslice_graph_rows[:rows],
+                    vocab_size=vocab,
+                )
+                self._draftslice_stats.calls += 1
+                self._draftslice_stats.graph_mask_calls += 1
+                self._emit_contract(
+                    mode="mask", vocab_size=vocab, execution_kind="full"
+                )
+            else:
+                self._draftslice_stats.graph_replay_calls += 1
+                self._draftslice_stats.record(sliced=False)
+                self._emit_contract(
+                    mode="full", reason="graph_later_step", vocab_size=vocab
+                )
+            return logits
         if not self._draftslice_enabled or not self._draftslice_slicing:
             if self._draftslice_graph_replay:
                 self._draftslice_stats.graph_replay_calls += 1
             else:
                 self._draftslice_stats.slice_disabled_calls += int(self._draftslice_enabled)
-            self._draftslice_stats.record(sliced=False)
-            return base_compute(hidden_states, spec_step_idx)
+            reason = "full_cuda_graph" if self._draftslice_graph_replay else "slicing_disabled"
+            return fallback(reason)
+        if self._draftslice_route_full:
+            self._draftslice_stats.routed_full_calls += 1
+            return fallback("router_freeform")
         if self._draftslice_dummy:
-            self._draftslice_stats.record(sliced=False)
-            return base_compute(hidden_states, spec_step_idx)
+            return fallback("dummy_run")
+        if self._draftslice_block and _block_allpos_enabled():
+            allpos = self._compute_block_allpos(hidden_states, spec_step_idx, base_compute)
+            if allpos is not None:
+                # All-position masking computes the full block head once, then
+                # masks each position, so its execution kind is "full".
+                self._emit_contract(mode="mask_allpos", execution_kind="full")
+                return allpos
         if self._draftslice_snapshot is None:
             self._draftslice_snapshot = current_grammar_snapshot()
         if self._draftslice_shadow is None and self._draftslice_spec_step != 0:
             self._draftslice_stats.nonzero_step_calls += 1
-            self._draftslice_stats.record(sliced=False)
-            return base_compute(hidden_states, spec_step_idx)
+            return fallback("later_step")
 
         self._ensure_screener()
         screener_config = self._draftslice_screener_config
@@ -878,67 +1622,123 @@ class DraftSliceSpeculatorMixin:
         if not screener_active:
             if no_state:
                 self._draftslice_stats.no_snapshot_calls += 1
-                self._draftslice_stats.record(sliced=False)
-                return base_compute(hidden_states, spec_step_idx)
+                return fallback("no_grammar_state")
             valid_sets = self._valid_sets_for_rows(hidden_states)
             if valid_sets is None or not any(
                 token_set is not None for token_set in valid_sets
             ):
                 self._draftslice_stats.no_valid_sets_calls += 1
-                self._draftslice_stats.record(sliced=False)
-                return base_compute(hidden_states, spec_step_idx)
+                return fallback("no_valid_sets")
         else:
             if screener_config.universe == "valid":
                 if no_state:
                     self._draftslice_stats.no_snapshot_calls += 1
-                    self._draftslice_stats.record(sliced=False)
-                    return base_compute(hidden_states, spec_step_idx)
+                    return fallback("no_grammar_state")
                 valid_sets = self._valid_sets_for_rows(hidden_states)
                 if valid_sets is None or not any(
                     token_set is not None for token_set in valid_sets
                 ):
                     self._draftslice_stats.no_valid_sets_calls += 1
-                    self._draftslice_stats.record(sliced=False)
-                    return base_compute(hidden_states, spec_step_idx)
+                    return fallback("no_valid_sets")
             else:
                 valid_sets = self._valid_sets_for_rows(hidden_states)
                 if valid_sets is None:
                     valid_sets = [None] * int(hidden_states.shape[0])
             valid_sets = self._apply_screener(hidden_states, valid_sets)
             if not any(token_set is not None for token_set in valid_sets):
-                self._draftslice_stats.record(sliced=False)
-                return base_compute(hidden_states, spec_step_idx)
+                return fallback("screener_empty", valid_sets)
 
-        weight = self._lm_head_weight()
-        if weight is None:
-            self._draftslice_stats.record(sliced=False)
-            return base_compute(hidden_states, spec_step_idx)
+        if _full_mask_enabled():
+            vocab = min(
+                int(getattr(self, "vocab_size", int(hidden_states.shape[1]))),
+                int(hidden_states.shape[1]),
+            )
+            logits = mask_logits_to_valid(
+                base_compute(hidden_states, spec_step_idx), valid_sets, vocab_size=vocab
+            )
+            self._draftslice_stats.calls += 1
+            self._draftslice_stats.full_mask_calls += 1
+            self._emit_contract(
+                mode="mask",
+                valid_sets=valid_sets,
+                vocab_size=vocab,
+                execution_kind="full",
+            )
+            return logits
+
+        head_view = self._slice_head()
+        if head_view is None:
+            # _slice_head already recorded the specific reason.
+            return fallback(None, valid_sets)
+        weight, shard = head_view
 
         scale, soft_cap, supported = self._logits_postprocess()
         if not supported:
-            self._draftslice_stats.record(sliced=False)
-            return base_compute(hidden_states, spec_step_idx)
+            return fallback("unsupported_logits_postprocess", valid_sets)
 
-        vocab_size = min(int(getattr(self, "vocab_size", weight.shape[0])), weight.shape[0])
+        vocab_size = min(
+            int(getattr(self, "vocab_size", shard.org_vocab_size) or shard.org_vocab_size),
+            shard.org_vocab_size,
+        )
+        if vocab_size <= 0:
+            return fallback("invalid_vocab_size", valid_sets)
+        deterministic = _deterministic_injection_enabled()
+        if deterministic:
+            self._draftslice_stats.deterministic_rows += sum(
+                1
+                for token_set in valid_sets
+                if token_set is not None and len(token_set) == 1
+            )
         t0 = time.perf_counter()
         try:
+            slicing_weight = self._prepare_weight(
+                weight,
+                valid_sets,
+                shard,
+                int(shard.shard_rows if shard is not None else vocab_size),
+                vocab_size,
+            )
+            if slicing_weight is None:
+                # Full head + exact grammar mask keeps A subset of V even when
+                # this rank cannot dequantize the candidate rows.
+                logits = mask_logits_to_valid(
+                    base_compute(hidden_states, spec_step_idx),
+                    valid_sets,
+                    vocab_size=vocab_size,
+                )
+                self._draftslice_stats.record(sliced=False)
+                self._emit_contract(
+                    mode="mask",
+                    valid_sets=valid_sets,
+                    vocab_size=vocab_size,
+                    execution_kind="full",
+                    reason="unsupported_quant_scheme",
+                )
+                return logits
             logits, stats = build_draft_logits(
                 hidden_states,
-                weight[:vocab_size],
+                slicing_weight,
                 valid_sets,
                 vocab_size=vocab_size,
                 full_logits=lambda rows: base_compute(rows, spec_step_idx),
                 max_slice_rows=_max_slice_rows(vocab_size),
                 scale=scale,
                 soft_cap=soft_cap,
+                deterministic=deterministic,
+                shard=shard,
             )
         except Exception as exc:  # pragma: no cover - defensive
             self._draftslice_stats.record_error(f"{type(exc).__name__}: {exc}")
-            self._draftslice_stats.record(sliced=False)
-            return base_compute(hidden_states, spec_step_idx)
+            return fallback("build_error", valid_sets)
 
         _TIMING["build"] += time.perf_counter() - t0
         self._draftslice_stats.record(sliced=True, stats=stats)
+        self._emit_contract(
+            mode="mask" if (self._draftslice_block or screener_active) else "strict",
+            valid_sets=valid_sets,
+            logits_stats=stats,
+            vocab_size=vocab_size,
+        )
         return logits
 
 

@@ -10,11 +10,14 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Literal
+from typing import Any, Literal
 
 KernelKind = Literal["auto", "slice_gemv", "slice_gemm", "full"]
 LayoutKind = Literal["native", "leaf_contiguous", "packed"]
 Universe = Literal["vocab", "valid"]
+ContractMode = Literal["strict", "mask", "mask_allpos", "full"]
+GuaranteeScope = Literal["mu_proj", "mu_star"]
+FallbackRule = Literal["full_head", "built_in_method", "none"]
 
 
 class GuaranteeKind(str, Enum):
@@ -101,14 +104,27 @@ class TokenSet:
 
 @dataclass(frozen=True, slots=True)
 class Guarantee:
-    """The coverage contract attached to a plan."""
+    """The coverage contract attached to a plan.
+
+    ``scope`` is the distribution the guarantee is relative to. DraftSlice only
+    ever claims ``mu_proj`` (the engine's locally-projected constrained
+    distribution); ``mu_star`` (a grammar-faithful distribution) is deliberately
+    not claimed. ``fallback_rule`` is the fail-closed action when a promise
+    cannot be kept for a row.
+    """
 
     kind: GuaranteeKind
     universe: Universe
     delta: float | None = None
     calibration_id: str | None = None
+    scope: GuaranteeScope = "mu_proj"
+    fallback_rule: FallbackRule = "full_head"
 
     def __post_init__(self) -> None:
+        if self.scope not in ("mu_proj", "mu_star"):
+            raise ValueError("guarantee scope must be 'mu_proj' or 'mu_star'")
+        if self.fallback_rule not in ("full_head", "built_in_method", "none"):
+            raise ValueError("invalid fallback rule")
         if self.kind is GuaranteeKind.CALIBRATED:
             if self.delta is None or not (0.0 < self.delta < 1.0):
                 raise ValueError("calibrated guarantees require 0 < delta < 1")
@@ -309,6 +325,116 @@ class StepPlan:
 
 
 @dataclass(frozen=True, slots=True)
+class ServingPoint:
+    """The server-side operating point chosen for a contract.
+
+    Records *why* a step ran the way it did, so benchmark and operations can
+    explain a ``k`` / ``mode`` choice instead of inferring it from output ids.
+    """
+
+    k: int = 0
+    source: str = "builtin"
+    expected_tau: float | None = None
+    target_metric: str = "throughput"
+    head_share: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.k < 0:
+            raise ValueError("k must be non-negative")
+        if self.expected_tau is not None and self.expected_tau < 0:
+            raise ValueError("expected_tau must be non-negative")
+        if self.head_share is not None and not (0.0 <= self.head_share <= 1.0):
+            raise ValueError("head_share must be in [0, 1]")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "k": self.k,
+            "source": self.source,
+            "expected_tau": self.expected_tau,
+            "target_metric": self.target_metric,
+            "head_share": self.head_share,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class DraftContract:
+    """Immutable end-to-end contract for one draft-head decision.
+
+    This is the concrete form of the production design's ``DraftContract``: it
+    follows a grammar state through candidate selection, execution, guarantee,
+    and the chosen serving point. It is data-only so it can be logged, serialized
+    and compared across vLLM/SGLang. The target verifier is never represented.
+    """
+
+    grammar_state_id: str | None
+    valid_set: TokenSet | None
+    candidate_set: TokenSet | None
+    mode: ContractMode
+    execution: Execution
+    guarantee: Guarantee
+    serving: ServingPoint
+    fallback_reason: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.mode not in ("strict", "mask", "mask_allpos", "full"):
+            raise ValueError(f"invalid contract mode: {self.mode!r}")
+        if self.guarantee.scope != "mu_proj":
+            raise ValueError("DraftSlice contracts must use the mu_proj scope")
+        if self.guarantee.fallback_rule == "none" and self.fallback_reason is not None:
+            raise ValueError("a contract with a fallback reason needs a fallback rule")
+        if self.mode == "strict":
+            if self.guarantee.kind is not GuaranteeKind.EXACT_VALID_SET:
+                raise ValueError("strict contracts require an exact-valid-set guarantee")
+            if self.candidate_set is None or self.valid_set is None:
+                raise ValueError("strict contracts carry both V and A")
+            if not self.candidate_set.issubset(self.valid_set):
+                raise ValueError("strict contracts require A subset of V")
+        elif self.mode in ("mask", "mask_allpos"):
+            if self.candidate_set is not None and self.valid_set is not None:
+                if not self.candidate_set.issubset(self.valid_set):
+                    raise ValueError("mask contracts require A subset of V")
+        else:  # full
+            if self.execution.kind != "full":
+                raise ValueError("full contracts use a full-head execution")
+            if self.candidate_set is not None:
+                raise ValueError("full contracts do not carry a candidate set")
+
+    @property
+    def is_sliced(self) -> bool:
+        return self.execution.kind != "full"
+
+    def to_dict(self) -> dict[str, Any]:
+        """JSON-safe view for stats and release manifests."""
+
+        def tokens(value: TokenSet | None) -> dict[str, Any] | None:
+            return None if value is None else {"count": len(value), "ids": list(value.ids)}
+
+        return {
+            "grammar_state_id": self.grammar_state_id,
+            "valid_set": tokens(self.valid_set),
+            "candidate_set": tokens(self.candidate_set),
+            "mode": self.mode,
+            "execution": {
+                "kind": self.execution.kind,
+                "rows": None
+                if self.execution.rows is None
+                else len(self.execution.rows),
+                "layout": self.execution.layout,
+            },
+            "guarantee": {
+                "kind": self.guarantee.kind.value,
+                "universe": self.guarantee.universe,
+                "delta": self.guarantee.delta,
+                "calibration_id": self.guarantee.calibration_id,
+                "scope": self.guarantee.scope,
+                "fallback_rule": self.guarantee.fallback_rule,
+            },
+            "serving": self.serving.to_dict(),
+            "fallback_reason": self.fallback_reason,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class Slice:
     """Legacy exact valid-token set.
 
@@ -325,14 +451,19 @@ class Slice:
 
 
 __all__ = [
+    "ContractMode",
+    "DraftContract",
     "Execution",
+    "FallbackRule",
     "Guarantee",
     "GuaranteeKind",
+    "GuaranteeScope",
     "HeadPlan",
     "KernelKind",
     "LayoutKind",
     "NodePlan",
     "PlanCost",
+    "ServingPoint",
     "Slice",
     "StepPlan",
     "TokenSet",

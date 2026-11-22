@@ -174,6 +174,77 @@ def test_grammar_candidates_reject_later_steps_and_oversize() -> None:
     )
 
 
+def test_tp_head_slices_local_rows_and_returns_local_logits(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    from draftslice.integrations import sglang as sg
+
+    class Grammar:
+        def is_terminated(self):
+            return False
+
+        def allocate_vocab_mask(self, vocab_size, batch_size, device):
+            return torch.zeros(
+                (batch_size, (vocab_size + 31) // 32), dtype=torch.int32
+            )
+
+        def fill_vocab_mask(self, mask, idx):
+            for token in (1, 3, 9, 11):
+                mask[idx, token // 32] |= 1 << (token % 32)
+
+    weight = torch.zeros(8, 4)
+    monkeypatch.setattr(sg, "_sliceable_weight", lambda lm_head: weight)
+    seen: dict[str, object] = {}
+
+    def fake_build(hidden, w, candidates, *, vocab_size, full_logits, max_slice_rows):
+        seen["candidates"] = candidates
+        seen["vocab_size"] = vocab_size
+        return torch.full((hidden.shape[0], vocab_size), -1.0), None
+
+    monkeypatch.setattr(sg, "build_draft_logits", fake_build)
+    monkeypatch.setattr(
+        sg,
+        "_ORIGINAL_LM_HEAD",
+        lambda self, hidden, lm_head, bias=None, *, out=None: torch.ones(
+            (hidden.shape[0], 8)
+        ),
+    )
+    head = SimpleNamespace(
+        weight=weight,
+        num_embeddings=16,
+        tp_size=2,
+        org_vocab_size=16,
+        num_embeddings_padded=16,
+        num_embeddings_per_partition=8,
+        shard_indices=SimpleNamespace(
+            org_vocab_start_index=8,
+            org_vocab_end_index=16,
+            padded_org_vocab_start_index=8,
+            added_vocab_start_index=16,
+            added_vocab_end_index=16,
+            num_org_elements_padded=8,
+        ),
+    )
+    hidden = torch.zeros(1, 4)
+    state = {
+        "step": 0,
+        "grammars": [Grammar()],
+        "hidden_states": hidden,
+        "config": sg.SglangConfig(enabled=True),
+    }
+    token = sg._DRAFT_STATE.set(state)
+    try:
+        sg._patched_compute_lm_head(
+            type("Processor", (), {"vocab_size": 16})(), hidden, head
+        )
+    finally:
+        sg._DRAFT_STATE.reset(token)
+    # Global ids 9/11 map to local rows 1/3 on rank 1; ids 1/3 are not owned.
+    assert seen["candidates"] == [TokenSet([1, 3])]
+    assert seen["vocab_size"] == 8
+    assert sg._STATS["tp_size"] == 2
+
+
 def test_step0_hook_uses_sliced_logits(monkeypatch) -> None:
     from draftslice.integrations import sglang as sg
 

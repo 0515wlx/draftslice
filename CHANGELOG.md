@@ -2,6 +2,64 @@
 
 ## Unreleased
 
+- Add the experiment-converged production architecture. Routing experiments on
+  Qwen3.5-4B/B8 show that a blanket structured DraftSlice profile is a
+  regression (0.767× mixed workload, p99 +36%), while identical built-in
+  pooling is neutral/slightly positive (1.022×). Production default is now
+  built-in MTP; DraftSlice is enabled only by a measured, content-hashed
+  per-cell profile table. See `docs/production-architecture.md`.
+- Add routing experiment drivers and raw results under `runs/routing/`
+  (gitignored) for the per-case matrix, the two-pool gateway, per-workload k
+  routing, and the summary table.
+- Make TP>1 a supported slicing path in the vLLM adapter: detect each rank's
+  contiguous vocabulary shard from the LM-head metadata, slice only that rank's
+  weight rows, and scatter logits back to global token-id columns. A rank whose
+  valid set has no local token takes a full-head fallback masked to V, so no
+  grammar-invalid token can be proposed. The full-head row set is rank-independent
+  so the TP logits all-gather stays balanced. Unprovable shard layouts, quantized
+  heads, FULL decode CUDA graphs, reasoning-parser shadows, and local-argmax
+  reduction all fail closed with recorded reasons. Verify the custom
+  `draftslice_mtp` config and end-to-end slicing under vLLM 0.34 TP=2
+  (Qwen3.5-0.8B structured JSON, valid output, slicing active on both ranks).
+- Cover the remaining production paths with concrete contracts instead of
+  silent full-head fallbacks: reasoning-parser shadows now activate only after
+  the end-of-reasoning boundary is observed; quant configs no longer reject bf16
+  heads and fp8/int8 heads dequantize candidate rows; local-argmax reduction uses
+  a sliced `get_draft_top_tokens` override with vLLM's `(value,id)` TP reduction;
+  FULL decode CUDA graphs apply a per-replay static packed bitmask with the fused
+  mask kernel (step≥1 stays full head because its state is GPU-resident); SGLang
+  TP heads slice local rows and return local logits for the engine's own gather.
+- Implement the production `DraftContract` data model (`grammar_state_id`, V, A,
+  mode, execution, guarantee, serving point) with serialization and deterministic
+  ids. The vLLM and SGLang adapters now emit a concrete contract per step and
+  expose `fallback_reasons` / `last_contract` through their stats. The contract
+  structurally enforces the μ^proj scope (no grammar-faithful claim).
+- Add an opt-in fused packed-bitmask kernel for DFlash all-position masking
+  (`DRAFTSLICE_VLLM_BLOCK_ALLPOS_FAST=1`) and an opt-in one-hot shortcut for
+  single-token valid sets (`DRAFTSLICE_VLLM_DETERMINISTIC=1`). Measured: the
+  fused mask removes the high-batch penalty of all-position masking (B=8:
+  1.18× over stock DFlash and 1.04× over position-0 slicing); the `|V|=1`
+  shortcut found zero qualifying rows on the reference tool schemas and is a
+  negative result. Both are default-off.
+- Add an opt-in vLLM workload router (`DRAFTSLICE_VLLM_ROUTER=1`) and a
+  batch-gated DFlash all-position grammar mask
+  (`DRAFTSLICE_VLLM_BLOCK_ALLPOS=1`, `..._MAX_BATCH`, `..._DEPTH`). The router
+  sends all-free-form batches through the stock speculator without shadow or
+  mapping bookkeeping; all-position masking advances one cloned matcher per
+  request and masks every block position under greedy sampling. Both are
+  default-off and leave current behavior unchanged. Add `row_mask`,
+  `begin_block`, `block_mask`, `block_advance`, and pinned async bitmask uploads
+  to the grammar shadow, plus unit tests.
+- Refresh README/architecture/competitive-plan/benchmark/design docs to the
+  current implementation: the worker shadow, DFlash block-position-0 slicing,
+  SGLang MTP hook, screener/artifact/router tooling, union executor, and the
+  actual engine fast path. Separate the offline plan/cost/scheduler/union layer
+  from the production fast path, and make server-level throughput/TTFT/ITL the
+  objective; `tau` is now an explicit tunable that may be traded for latency.
+- Add the `DRAFTSLICE_VLLM_FULL_MASK=1` diagnostic control (full head + exact
+  grammar mask). It is off by default and is used to separate acceptance gains
+  from slicing gains in B4 experiments.
+- Add `mask_logits_to_valid()` with tests; no default behavior change.
 - Split development into three verified environments because vLLM 0.34 and
   SGLang 0.5.23 pin incompatible torch/xgrammar/flashinfer stacks:
   `wlx_draftslice` (engine-free), `wlx_draftslice_vllm`, and

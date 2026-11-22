@@ -37,6 +37,20 @@ class ShadowError(RuntimeError):
 
 _STATE_CACHE: OrderedDict[bytes, TokenSet | None] = OrderedDict()
 _STATE_CACHE_MAX = 4096
+_SHIFT_CACHE: dict[str, Any] = {}
+
+
+def _shifts_for(device: Any) -> Any:
+    """Cached 0..31 shift vector for unpacking an xgrammar bitmask."""
+
+    import torch
+
+    key = str(device)
+    shifts = _SHIFT_CACHE.get(key)
+    if shifts is None:
+        shifts = torch.arange(32, device=device, dtype=torch.int32)
+        _SHIFT_CACHE[key] = shifts
+    return shifts
 
 
 def _mix_key(key: bytes, tokens: list[int]) -> bytes:
@@ -61,6 +75,10 @@ class _ShadowEntry:
     state_key: bytes = b""
     step_grammars: dict[int, Any] = field(default_factory=dict)
     step_keys: dict[int, bytes] = field(default_factory=dict)
+
+    reasoner: Any | None = None
+    grammar_active: bool = True
+    all_tokens: list[int] = field(default_factory=list)
 
     def grammar_for(self, step: int) -> Any:
         return self.step_grammars.get(step, self.grammar)
@@ -101,6 +119,8 @@ class GrammarShadowRegistry:
             "forks": 0,
             "fork_failures": 0,
             "fork_accept_failures": 0,
+            "reasoning_pending": 0,
+            "reasoning_activated": 0,
         }
 
     def debug_dict(self) -> dict[str, int]:
@@ -111,13 +131,7 @@ class GrammarShadowRegistry:
     @property
     def enabled(self) -> bool:
         structured = getattr(self.vllm_config, "structured_outputs_config", None)
-        if structured is None:
-            return False
-        # Reasoning prefixes delay the grammar start; leave those to the
-        # scheduler snapshot until the shadow mirrors `constraint_start`.
-        if getattr(structured, "reasoning_parser", ""):
-            return False
-        return True
+        return structured is not None
 
     def _ensure_backend(self) -> Any | None:
         if not self.enabled:
@@ -177,12 +191,35 @@ class GrammarShadowRegistry:
             grammar_tag = tag.digest()
         except Exception as exc:  # pragma: no cover - defensive
             raise ShadowError(f"compile failed for request {req_index}: {exc}") from exc
+        reasoner = self._make_reasoner()
         req_id = getattr(sampling_params, "request_id", None) or str(req_index)
         with self._lock:
             self.entries[int(req_index)] = _ShadowEntry(
-                req_id=req_id, grammar=grammar, state_key=grammar_tag
+                req_id=req_id,
+                grammar=grammar,
+                state_key=grammar_tag,
+                reasoner=reasoner,
+                grammar_active=reasoner is None,
             )
             self.stats["registered"] += 1
+
+    def _make_reasoner(self) -> Any | None:
+        """Mirror vLLM's reasoning boundary gate in the worker process."""
+
+        structured = getattr(self.vllm_config, "structured_outputs_config", None)
+        name = getattr(structured, "reasoning_parser", "")
+        if not name or getattr(structured, "enable_in_reasoning", False):
+            return None
+        try:
+            from vllm.reasoning import ReasoningParserManager
+
+            plugin = getattr(structured, "reasoning_parser_plugin", "")
+            if plugin:
+                ReasoningParserManager.import_reasoning_parser(plugin)
+            parser_cls = ReasoningParserManager.get_reasoning_parser(name)
+            return parser_cls(tokenizer=self.tokenizer)
+        except Exception as exc:  # pragma: no cover - defensive
+            raise ShadowError(f"cannot build reasoning parser {name!r}: {exc}") from exc
 
     def drop(self, req_ids: set[str]) -> None:
         if not req_ids:
@@ -235,12 +272,53 @@ class GrammarShadowRegistry:
             tokens = [int(token) for token in sampled_tokens_np[row][:count]]
             self.stats["advanced_reqs"] += 1
             self.stats["advanced_tokens"] += len(tokens)
-            try:
-                entry.grammar.accept_tokens(entry.req_id, tokens)
-            except Exception as exc:  # pragma: no cover - defensive
-                raise ShadowError(f"advance failed for request {entry.req_id}: {exc}") from exc
+            accepted = self._advance_reasoning(entry, tokens)
+            if accepted:
+                try:
+                    entry.grammar.accept_tokens(entry.req_id, accepted)
+                except Exception as exc:  # pragma: no cover - defensive
+                    raise ShadowError(
+                        f"advance failed for request {entry.req_id}: {exc}"
+                    ) from exc
             entry.state_key = _mix_key(entry.state_key, tokens)
             entry.clear_steps()
+
+    def _advance_reasoning(self, entry: _ShadowEntry, tokens: list[int]) -> list[int]:
+        """Return the tokens that belong to the constrained (post-reasoning) part."""
+
+        if entry.grammar_active:
+            if entry.reasoner is not None:
+                entry.all_tokens.extend(tokens)
+            return tokens
+        self.stats["reasoning_pending"] += 1
+        reasoner = entry.reasoner
+        if reasoner is None:
+            return []
+        previous = list(entry.all_tokens)
+        entry.all_tokens.extend(tokens)
+        end_ids = getattr(reasoner, "reasoning_end_token_ids", None)
+        if end_ids:
+            try:
+                end = reasoner.find_reasoning_end(tokens)
+            except Exception:  # pragma: no cover - parser specific
+                end = None
+            if end is not None and int(getattr(end, "offset", len(tokens))) < len(tokens):
+                offset = int(end.offset)
+                if not getattr(end, "implicit", False):
+                    offset += 1
+                entry.grammar_active = True
+                self.stats["reasoning_activated"] += 1
+                return tokens[offset:]
+            return []
+        try:
+            ended = reasoner.is_reasoning_end_streaming(previous, tokens)
+        except Exception:  # pragma: no cover - parser specific
+            ended = False
+        if ended:
+            entry.grammar_active = True
+            self.stats["reasoning_activated"] += 1
+            return tokens
+        return []
 
     def _new_bitmask(self) -> Any:
         if self._bitmask is None:
@@ -256,6 +334,8 @@ class GrammarShadowRegistry:
         entry = self.entries.get(int(req_index))
         if entry is None:
             self.stats["valid_missing"] += 1
+            return None
+        if not entry.grammar_active:
             return None
         if step > 0 and step not in entry.step_grammars:
             # The fork for this position was unavailable (terminated grammar or
@@ -291,11 +371,156 @@ class GrammarShadowRegistry:
         _cache_state(state_key, result)
         return result
 
+    def _unpack_bitmask(
+        self, bitmask: Any, *, vocab_size: int | None, device: Any | None
+    ) -> Any:
+        import torch
+
+        from .vllm_logits import upload_numpy
+
+        packed_np = np.asarray(bitmask[0].numpy(), dtype=np.int32)
+        if device is not None and getattr(device, "type", None) == "cuda":
+            packed = upload_numpy(packed_np, device)
+        else:
+            packed = torch.from_numpy(packed_np)
+        shifts = _shifts_for(packed.device)
+        mask = ((packed.unsqueeze(1) >> shifts) & 1).to(torch.bool).reshape(-1)
+        if vocab_size is not None:
+            mask = mask[: int(vocab_size)]
+        return mask
+
+    def row_mask(
+        self,
+        req_index: int,
+        *,
+        step: int = 0,
+        vocab_size: int | None = None,
+        device: Any | None = None,
+    ) -> Any | None:
+        """Return the valid-token boolean mask without building a ``TokenSet``.
+
+        ``valid_ids`` builds a Python tuple of ids, which is expensive when a
+        caller only needs to mask logits (for example the DFlash all-position
+        path, which needs one mask per block position). This returns the same
+        xgrammar bitmask unpacked as a GPU bool vector.
+        """
+
+        entry = self.entries.get(int(req_index))
+        if entry is None:
+            return None
+        if not entry.grammar_active:
+            return None
+        if step > 0 and step not in entry.step_grammars:
+            return None
+        grammar = entry.grammar_for(step)
+        try:
+            if grammar.is_terminated():
+                return None
+            bitmask = self._new_bitmask()
+            grammar.fill_bitmask(bitmask, 0)
+            return self._unpack_bitmask(
+                bitmask, vocab_size=vocab_size, device=device
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            self.stats["valid_errors"] += 1
+            raise ShadowError(
+                f"row mask failed for request {entry.req_id}: {exc}"
+            ) from exc
+
+    def begin_block(self, req_index: int) -> Any | None:
+        """Clone a matcher once so a block can advance it position by position.
+
+        The DFlash all-position path needs the mask at position ``p+1`` after
+        the token at ``p`` is known, but it does not need to keep every
+        intermediate matcher. Cloning once and advancing the clone avoids the
+        per-position ``fork`` and keeps the registry's persistent matcher at the
+        verified prefix.
+        """
+
+        entry = self.entries.get(int(req_index))
+        if entry is None or not entry.grammar_active:
+            return None
+        try:
+            if entry.grammar.is_terminated():
+                return None
+            work = _fork_grammar(entry.grammar)
+        except Exception:  # pragma: no cover - defensive
+            return None
+        if work is None:
+            return None
+        return (entry, work)
+
+    def block_mask(
+        self,
+        work: Any,
+        *,
+        vocab_size: int | None = None,
+        device: Any | None = None,
+    ) -> Any | None:
+        entry, grammar = work
+        try:
+            if grammar.is_terminated():
+                return None
+            bitmask = self._new_bitmask()
+            grammar.fill_bitmask(bitmask, 0)
+            return self._unpack_bitmask(
+                bitmask, vocab_size=vocab_size, device=device
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            self.stats["valid_errors"] += 1
+            raise ShadowError(
+                f"block mask failed for request {entry.req_id}: {exc}"
+            ) from exc
+
+    def batch_block_masks(
+        self,
+        handles: dict[int, Any],
+        *,
+        vocab_size: int,
+        device: Any | None = None,
+    ) -> Any | None:
+        """Fill one packed bitmask row per request for the current position.
+
+        Invalid/terminated matchers get an all-ones row, which is a no-op mask:
+        their logits stay on the full head instead of being wiped to ``-inf``.
+        """
+
+        if not handles:
+            return None
+        import torch
+
+        from .vllm_logits import upload_numpy
+
+        words = (int(vocab_size) + 31) // 32
+        packed = torch.zeros((len(handles), words), dtype=torch.int32)
+        for index, handle in enumerate(handles.values()):
+            entry, grammar = handle
+            try:
+                if grammar.is_terminated():
+                    packed[index].fill_(-1)
+                    continue
+                grammar.fill_bitmask(packed, index)
+            except Exception as exc:  # pragma: no cover - defensive
+                self.stats["valid_errors"] += 1
+                raise ShadowError(
+                    f"batch mask failed for request {entry.req_id}: {exc}"
+                ) from exc
+        return upload_numpy(packed.numpy(), device)
+
+    def block_advance(self, work: Any, token_id: int) -> bool:
+        entry, grammar = work
+        try:
+            if grammar.is_terminated():
+                return False
+            return bool(grammar.accept_tokens(entry.req_id, [int(token_id)]))
+        except Exception:  # pragma: no cover - defensive
+            return False
+
     def fork_step(self, req_index: int, token_id: int, *, step: int) -> bool:
         """Fork the current step matcher and accept one proposed draft token."""
 
         entry = self.entries.get(int(req_index))
-        if entry is None:
+        if entry is None or not entry.grammar_active:
             self.stats["fork_failures"] += 1
             return False
         try:
