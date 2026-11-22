@@ -259,13 +259,27 @@ alarm_fallback_rate = 0.05
 | 拓扑 | 使用条件 | 当前状态 |
 |---|---|---|
 | T1 单 profile | enabled cells 共享 `(method,k)`；默认 | 4B 最佳：2× built-in MTP |
-| T2 profile gateway | k/method 冲突且收益扛得住池化 | 4B 已证伪；35B-A3B E1 重跑 balanced 1.09× / tool-heavy 1.02×，不建 |
+| T2 profile gateway | k/method 冲突且收益扛得住池化 | 4B 已证伪；35B-A3B E1/E5 同轮 balanced 1.098× / tool-heavy 1.038×，不建。batch 维度由每步 policy 处理，gateway 无法按 batch 路由 |
 | T3 多模型 gateway | 多模型/多 profile 统一入口 | 可选；必须有逐 profile 收益 |
 
 Gateway 若建：每池固定 `(engine,method,k,tp,quant,graph)`；精确 cell 路由；
 按 outstanding/queue 做容量感知，但不做请求中途迁移、不在首 token 后重试；
 overflow 只去 capability 兼容的 profile，并记录 degraded action；必须比同 GPU
 预算的最佳单部署 ≥1.05× 吞吐或 ≥20% p99 改善。
+
+**Batch 维度不进 gateway。** vLLM 是 continuous batching：batch 大小是每个
+decode step 的属性（`max_num_seqs`/token budget/running queue 决定），不是请求
+属性；同一个请求这一秒在 B=1、下一秒可能在 B=16。请求级 gateway 无法知道
+batch bucket，因此不能按 batch 路由。`batch_bucket`/`valid_bucket`/workload
+都只在 adapter 的每步 policy 里判定（P1 已实现，逐 step 精确匹配，允许同请求
+在不同 step 切换 slice/built-in，不迁移池、不重试）。Gateway 只处理固定
+per-server 冲突：`method`/`k`/`tp`/`quant`/`graph`。
+
+由此还有两个运营结论：
+- `batch_bucket="1"` 的 cell 只在单流行情下命中；共享 server 高负载时几乎不
+  触发。要拿到这个收益，需要专用单流副本（`--max-num-seqs 1`）或独立
+  endpoint；gateway 不会让小 batch 变多。
+- 延迟分级优先用 vLLM 的 priority scheduling 或限流副本，而不是先建 gateway。
 
 ---
 
@@ -293,6 +307,7 @@ tau/validity/fallback）。Sinks：进程内 registry、JSONL 采样、Prometheu
 | E2 | 4B B=1 全矩阵（k=4/8） | k=8 tool slice 1.24×（均值 1.286×）；k=4 tool 1.03×/中位 0.998×；free/json/regex <1 | **启用 4B B=1 tool k=8 cell**；其余 built-in |
 | E3 | DFlash all-position vs built-in MTP，B=1/8 tool | DFast vs DFlash 1.24×；vs MTP B1 +10.5%、B8 −1.6%；vs MTP slice B1 −10.7% | **4B tool 不启用 DFlash** |
 | E4 | P1 单 profile policy：空表 observe / 全 disabled enforce A/A；enabled cell 冒烟 | 4B TP=1，16 并发：baseline 1252.4 tok/s/GPU；empty+observe 1239.3（0.99×）；disabled+enforce 1217.8（0.97×）；B1 tool enforce 与 legacy slice 同为 tau 8.34、吞吐差 <2%；B=16 tool 0.54× | **observe/disabled A/A 通过；B≥8 不启用；B1 tool cell 需按生产 grammar 复跑 p99/多 seed** |
+| E5 | 35B-A3B TP=2 三臂同轮：baseline MTP / 两类池 gateway / 单配置+每步 policy | balanced：200.9 / 220.5（1.098×）/ 200.0（0.996×）；tool-heavy：190.2 / 197.4（1.038×）/ 196.5（1.033×）；policy p99 比 baseline +12%/+19%；实测 `num_requests_running` 0..6 波动 | **gateway 不建（偏斜 mix 未过 1.05×）；batch 变化由每步 policy 处理，gateway 不按 batch 路由；T1 默认** |
 
 下一任务优先实验：
 
@@ -314,7 +329,11 @@ MTP k=4 240（1.29×）；B=32 tool slice k=1 730 vs MTP k=4 585（1.25×）。
 - 不把“structured 一律 slice”带进生产；4B B=8 是 0.767×。
 - 不用“over stock DFlash”替代“over best built-in”的对照。
 - 不在固定池/偏斜 mix 下假设 gateway 会更好；4B k 路由 tool-heavy 是
-  0.957×、p99 +36%。
+  0.957×、p99 +36%。35B E5 的两类池 gateway 在 balanced 是 1.098×、tool-heavy
+  只有 1.038×。
+- 混合类 batch（free+tool）里切片只省 tool 行，full 行仍要跑完整 head；
+  单配置 policy 的 p99 在 35B 上比 baseline 差 12–19%。不要把 balanced 的
+  gateway 收益推广到偏斜 mix。
 - **TP>1 MoE 可运行，但还没有启用 cell**：35B-A3B `draftslice_mtp` TP=2 的
   hang 已修复（replicated logits + full-row agreement，含回归测试）；但 E1 重跑
   在 tool-heavy mix 只有 1.021×，35B-A3B 仍保持 built-in，不建 gateway。

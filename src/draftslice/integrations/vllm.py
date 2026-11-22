@@ -37,6 +37,7 @@ from ..plan.types import (
     TokenSet,
 )
 from ..runtime.policy import PolicyDecision, RowFacts, StepFacts
+from ..runtime.profile import batch_bucket
 from ..runtime.trace import (
     StepTrace,
     TraceDecision,
@@ -145,6 +146,8 @@ class DraftSliceVllmStats:
     row_share: float = 0.0
     measured_head_share: float | None = None
     trace_count: int = 0
+    # Actual per-step batch distribution (draft rows), as profile-table buckets.
+    batch_buckets: dict[str, int] = field(default_factory=dict)
 
     def note_fallback(self, reason: str) -> None:
         """Record a fail-closed decision without flooding the error list."""
@@ -226,6 +229,7 @@ class DraftSliceVllmStats:
             "row_share": self.row_share,
             "measured_head_share": self.measured_head_share,
             "trace_count": self.trace_count,
+            "batch_buckets": dict(self.batch_buckets),
             "quantized_head": self.quantized_head,
             "quantized_rows": self.quantized_rows,
             "last_error": self.last_error,
@@ -1535,6 +1539,10 @@ class DraftSliceSpeculatorMixin:
                 self._tp_world_size(),
             ),
         )
+        if rows:
+            bucket = batch_bucket(max(1, len(rows)))
+            stats = self._draftslice_stats
+            stats.batch_buckets[bucket] = stats.batch_buckets.get(bucket, 0) + 1
         facts = StepFacts(
             engine="vllm",
             model=model_name,
