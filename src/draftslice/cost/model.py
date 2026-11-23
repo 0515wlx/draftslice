@@ -43,6 +43,17 @@ class CostModel:
         self.dtype_bytes = dtype_bytes
         self._profiles = dict(profiles) if profiles is not None else None
 
+    @property
+    def calibrated(self) -> bool:
+        """Whether predictions may gate a production decision.
+
+        The roofline constants are uncalibrated by default; only a
+        :class:`~draftslice.cost.calibration.CalibratedCostModel` that passed its
+        held-out MAPE gate returns ``True``.
+        """
+
+        return False
+
     def _profile(self, name_or_profile: str | HardwareProfile) -> HardwareProfile:
         if isinstance(name_or_profile, HardwareProfile):
             return name_or_profile
