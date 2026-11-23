@@ -30,6 +30,7 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 from ..constraints.xgrammar import bitmask_to_token_set
+from ..cost import CalibratedCostModel, CostCalibration
 from ..plan.types import (
     DraftContract,
     Execution,
@@ -38,7 +39,9 @@ from ..plan.types import (
     ServingPoint,
     TokenSet,
 )
+from ..runtime.plan_session import PlanSession, PlanSessionConfig, PlanSessionResult
 from ..runtime.policy import PolicyDecision, RowFacts, StepFacts
+from ..runtime.scheduler import StepContext, StepScheduler
 from ..runtime.trace import (
     StepTrace,
     TraceDecision,
@@ -57,7 +60,7 @@ from .base import (
     trace_sample_from_env,
 )
 from .head_shard import HeadShard
-from .vllm_logits import build_draft_logits
+from .vllm_logits import build_draft_logits, mask_logits_to_valid
 
 _REGISTERED = False
 _PATCHED = False
@@ -67,8 +70,13 @@ _DRAFT_STATE: ContextVar[dict[str, Any] | None] = ContextVar(
 _ORIGINAL_DRAFT: Any | None = None
 _ORIGINAL_LM_HEAD: Any | None = None
 _ORIGINAL_DRAFTS: dict[type, Any] = {}
+_ORIGINAL_DFLASH: Any | None = None
 _SCREENER: Screener | None = None
 _SCREENER_READY = False
+_PLAN_SESSION: PlanSession | None = None
+_PLAN_KEY: tuple[int, int] | None = None
+_PLAN_SCHEDULER: StepScheduler | None = None
+_PLAN_SCHEDULER_READY = False
 _STATS: dict[str, Any] = {
     "step0_calls": 0,
     "sliced_calls": 0,
@@ -87,6 +95,22 @@ _STATS: dict[str, Any] = {
     "row_share": 0.0,
     "measured_head_share": None,
     "trace_count": 0,
+    "plan_compile_us": 0.0,
+    "plan_compile_total_us": 0.0,
+    "plan_cache_hit": False,
+    "plan_cache_miss": False,
+    "candidate_cache_hit": False,
+    "candidate_cache_miss": False,
+    "plan_cache_hits": 0,
+    "plan_cache_misses": 0,
+    "candidate_cache_hits": 0,
+    "candidate_cache_misses": 0,
+    "scheduler_action": "",
+    "scheduler_reason": "",
+    "eagle_steps": 0,
+    "dflash_steps": 0,
+    "dflash_fallback_steps": 0,
+    "dflash_reason": "",
 }
 
 
@@ -110,6 +134,25 @@ def _contract_reason(lm_head: Any) -> str:
     if num_embeddings is not None and int(num_embeddings) != int(weight.shape[0]):
         return "padded_or_sharded_head"
     return "unsupported_head"
+
+
+def _append_trace_jsonl(record: dict[str, Any]) -> None:
+    """Append one contract record to the sink, if configured.
+
+    SGLang runs the plugin hooks in the scheduler process, so an in-process
+    stats dict is not visible to the benchmark client. A JSONL sink is the
+    smallest cross-process channel for the P4 runner.
+    """
+
+    path = os.environ.get("DRAFTSLICE_TRACE_JSONL", "").strip()
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
+    except OSError:
+        # Telemetry must never fail a decode step.
+        pass
 
 
 def _emit_contract(
@@ -162,6 +205,7 @@ def _emit_contract(
     _STATS["last_contract"] = contract.to_dict()
     if reason is not None:
         _note_fallback(reason)
+    _append_trace_jsonl({"schema": "draftslice-sglang/1", "contract": _STATS["last_contract"]})
 
 
 class SglangIntegrationError(RuntimeError):
@@ -184,6 +228,8 @@ class SglangConfig:
     workload: str = "structured"
     quant: str = "auto"
     graph: str = "eager"
+    allpos: bool = False
+    mask_only: bool = False
 
     def __post_init__(self) -> None:
         if self.max_rows <= 0:
@@ -192,6 +238,22 @@ class SglangConfig:
 
 def _flag(name: str, default: str = "0") -> bool:
     return os.environ.get(name, default) not in ("0", "false", "False", "")
+
+
+def _plan_mode() -> str:
+    """How the plan session participates in the SGLang hot path.
+
+    ``off`` (default) keeps the direct slice path; the plan is not compiled
+    because the adapter still executes ``build_draft_logits``, not
+    ``ProductionExecutor``. ``telemetry``/``enforce`` opt in for stats or for
+    the cost scheduler gate.
+    """
+
+    return os.environ.get("DRAFTSLICE_SGLANG_PLAN", "off").strip().lower()
+
+
+def _plan_enabled() -> bool:
+    return _plan_mode() in ("1", "true", "telemetry", "enforce")
 
 
 def _json_args(name: str) -> dict[str, Any] | None:
@@ -230,6 +292,8 @@ def config_from_env() -> SglangConfig:
         workload=os.environ.get("DRAFTSLICE_WORKLOAD", "").strip() or "structured",
         quant=os.environ.get("DRAFTSLICE_QUANT", "").strip() or "auto",
         graph=os.environ.get("DRAFTSLICE_GRAPH", "").strip() or "eager",
+        allpos=_flag("DRAFTSLICE_SGLANG_ALLPOS"),
+        mask_only=_flag("DRAFTSLICE_SGLANG_MASK_ONLY"),
     )
 
 
@@ -368,6 +432,81 @@ def stats() -> dict[str, Any]:
     return out
 
 
+def _load_plan_scheduler(vocab: int, width: int) -> StepScheduler | None:
+    global _PLAN_SCHEDULER, _PLAN_SCHEDULER_READY
+    if _PLAN_SCHEDULER_READY:
+        return _PLAN_SCHEDULER
+    _PLAN_SCHEDULER_READY = True
+    path = os.environ.get("DRAFTSLICE_COST_CALIBRATION", "").strip()
+    if not path or vocab <= 0 or width <= 0:
+        return None
+    try:
+        calibration = CostCalibration.load(path)
+        model = CalibratedCostModel(
+            vocab_size=vocab, hidden_size=width, calibration=calibration
+        )
+        _PLAN_SCHEDULER = StepScheduler(model)
+    except Exception as exc:
+        raise SglangIntegrationError(
+            f"cannot load DRAFTSLICE_COST_CALIBRATION: {exc}"
+        ) from exc
+    return _PLAN_SCHEDULER
+
+
+def _plan_step(
+    candidates: list[Any],
+    decision: PolicyDecision,
+    *,
+    rows: int,
+    vocab: int,
+    width: int,
+) -> PlanSessionResult | None:
+    global _PLAN_SESSION, _PLAN_KEY
+    if vocab <= 0 or width <= 0:
+        return None
+    key = (vocab, width)
+    if _PLAN_SESSION is None or _PLAN_KEY != key:
+        _PLAN_SESSION = PlanSession(
+            PlanSessionConfig(
+                vocab_size=vocab,
+                hidden_size=width,
+                max_rows=int(os.environ.get("DRAFTSLICE_SGLANG_MAX_ROWS", "32768")),
+            ),
+            scheduler=_load_plan_scheduler(vocab, width),
+        )
+        _PLAN_KEY = key
+    try:
+        result = _PLAN_SESSION.build(
+            candidates[:rows],
+            action=decision.action,
+            row_mask=decision.row_mask,
+            context=StepContext(batch=max(1, rows)),
+            cell=decision.cell,
+        )
+    except Exception as exc:
+        _STATS["plan_error"] = f"{type(exc).__name__}: {exc}"
+        return None
+    _STATS["plan_compile_us"] = result.plan_compile_us
+    _STATS["plan_compile_total_us"] += result.plan_compile_us
+    _STATS["plan_cache_hit"] = result.plan_cache_hit
+    _STATS["plan_cache_miss"] = result.plan_cache_miss
+    _STATS["candidate_cache_hit"] = result.candidate_cache_hit
+    _STATS["candidate_cache_miss"] = result.candidate_cache_miss
+    _STATS["plan_cache_hits"] = int(result.explanation.get("plan_cache_hits", 0) or 0)
+    _STATS["plan_cache_misses"] = int(
+        result.explanation.get("plan_cache_misses", 0) or 0
+    )
+    _STATS["candidate_cache_hits"] = int(
+        result.explanation.get("candidate_cache_hits", 0) or 0
+    )
+    _STATS["candidate_cache_misses"] = int(
+        result.explanation.get("candidate_cache_misses", 0) or 0
+    )
+    _STATS["scheduler_action"] = result.scheduler_decision
+    _STATS["scheduler_reason"] = result.scheduler_reason
+    return result
+
+
 def _ensure_screener(config: SglangConfig) -> Screener | None:
     """Load the optional screener once per process."""
 
@@ -471,6 +610,119 @@ def _grammar_candidates(
     ]
 
 
+def _fork_grammar_object(grammar: Any) -> Any | None:
+    """Clone the current xgrammar matcher; ``None`` when unsupported."""
+
+    if grammar is None:
+        return None
+    try:
+        if grammar.is_terminated():
+            return None
+    except Exception:
+        pass
+    try:
+        matcher = grammar.matcher.fork()
+        return type(grammar)(
+            matcher=matcher,
+            vocab_size=grammar.vocab_size,
+            ctx=grammar.ctx,
+            override_stop_tokens=grammar.override_stop_tokens,
+            key_string=grammar.key_string,
+            grammar_stats=grammar.grammar_stats,
+        )
+    except Exception as exc:
+        if os.environ.get("DRAFTSLICE_SGLANG_STATE_DEBUG") == "1":
+            import sys
+
+            print(
+                f"[draftslice:fork] matcher.fork failed: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+    try:
+        shadow = grammar.copy()
+        for token in getattr(grammar, "accepted_tokens", ()) or ():
+            shadow.accept_token(int(token))
+        return shadow
+    except Exception as exc:
+        if os.environ.get("DRAFTSLICE_SGLANG_STATE_DEBUG") == "1":
+            import sys
+
+            print(
+                f"[draftslice:fork] copy failed: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+        return None
+
+
+def _shadow_candidates(
+    state: dict[str, Any],
+    rows: int,
+    vocab_size: int,
+    *,
+    max_rows: int,
+) -> list[TokenSet | None] | None:
+    """Candidate sets for draft positions after step 0, from per-request shadows."""
+
+    shadows = state.get("shadows")
+    if not shadows:
+        return None
+    batch = len(shadows)
+    if batch <= 0 or rows % batch != 0:
+        return None
+    repeat = rows // batch
+    mask = None
+    per_request: list[TokenSet | None] = []
+    for index, shadow in enumerate(shadows):
+        if shadow is None:
+            per_request.append(None)
+            continue
+        try:
+            if shadow.is_terminated():
+                per_request.append(None)
+                continue
+            if mask is None:
+                mask = shadow.allocate_vocab_mask(vocab_size, batch, "cpu")
+            shadow.fill_vocab_mask(mask, index)
+            tokens = bitmask_to_token_set(mask[index], vocab_size)
+        except Exception:
+            per_request.append(None)
+            continue
+        if tokens.is_empty or len(tokens) > max_rows:
+            per_request.append(None)
+            continue
+        per_request.append(tokens)
+    if not any(tokens is not None for tokens in per_request):
+        return None
+    return [per_request[index // repeat] if repeat else None for index in range(rows)]
+
+
+def _advance_shadows(state: dict[str, Any], logits: Any) -> None:
+    """Advance each draft-time shadow by the token the draft model selected."""
+
+    shadows = state.get("shadows")
+    if not shadows:
+        return
+    try:
+        selected = logits.argmax(dim=-1).tolist()
+    except Exception:
+        return
+    if len(selected) != len(shadows):
+        return
+    for index, token in enumerate(selected):
+        shadow = shadows[index]
+        if shadow is None:
+            continue
+        try:
+            if shadow.is_terminated():
+                shadows[index] = None
+                continue
+            shadow.accept_token(int(token))
+        except Exception:
+            shadows[index] = None
+
+
 def _sliceable_weight(lm_head: Any) -> Any | None:
     weight = getattr(lm_head, "weight", None)
     if weight is None or getattr(weight, "device", None) is None:
@@ -506,16 +758,17 @@ def _patched_compute_lm_head(
             self, hidden_states, lm_head, embedding_bias, out=out
         )
 
+    config: SglangConfig = state["config"]
     step = int(state.get("step", 0))
-    if step != 0:
+    allpos = bool(getattr(config, "allpos", False)) and step > 0
+    if step != 0 and not allpos:
         state["step"] = step + 1
         return _ORIGINAL_LM_HEAD(
             self, hidden_states, lm_head, embedding_bias, out=out
         )
-
-    config: SglangConfig = state["config"]
     state["step"] = step + 1
-    _STATS["step0_calls"] += 1
+    if step == 0:
+        _STATS["step0_calls"] += 1
     _STATS["tp_size"] = int(getattr(lm_head, "tp_size", 1) or 1)
     _STATS["tp_rank"] = int(getattr(lm_head, "tp_rank", 0) or 0)
     hold = _policy_hold(config)
@@ -524,6 +777,18 @@ def _patched_compute_lm_head(
         _STATS["fallback_calls"] += 1
         _note_fallback(hold.value)
         _emit_contract(mode="full", reason=hold.value)
+        return _ORIGINAL_LM_HEAD(
+            self, hidden_states, lm_head, embedding_bias, out=out
+        )
+    gate_vocab = int(
+        getattr(self, "vocab_size", getattr(lm_head, "num_embeddings", 0)) or 0
+    )
+    scheduler = _load_plan_scheduler(gate_vocab, int(hidden_states.shape[1]))
+    if scheduler is not None and not scheduler.calibrated:
+        # Gate first: no candidate construction, shadow update, policy eval, or
+        # plan compilation when the model is not allowed to choose a slice.
+        _STATS["fallback_calls"] += 1
+        _emit_contract(mode="full", reason="uncalibrated_cost")
         return _ORIGINAL_LM_HEAD(
             self, hidden_states, lm_head, embedding_bias, out=out
         )
@@ -558,15 +823,55 @@ def _patched_compute_lm_head(
     )
     kernel_vocab = int(weight.shape[0])
     state["hidden_states"] = hidden_states
-    candidates = _grammar_candidates(
-        state,
-        rows,
-        global_vocab,
-        max_rows=config.max_rows,
-        device=hidden_states.device,
-        screener=_ensure_screener(config),
-        step=step,
-    )
+    if step == 0 and state.get("shadows"):
+        candidates = _shadow_candidates(
+            state, rows, global_vocab, max_rows=config.max_rows
+        )
+    elif step == 0:
+        candidates = _grammar_candidates(
+            state,
+            rows,
+            global_vocab,
+            max_rows=config.max_rows,
+            device=hidden_states.device,
+            screener=_ensure_screener(config),
+            step=step,
+        )
+    elif allpos and rows == len(state.get("shadows") or ()):
+        candidates = _shadow_candidates(
+            state, rows, global_vocab, max_rows=config.max_rows
+        )
+    else:
+        candidates = None
+    if os.environ.get("DRAFTSLICE_SGLANG_STATE_DEBUG") == "1":
+        import sys
+
+        if candidates is None:
+            shadows = state.get("shadows") or ()
+            print(
+                "[draftslice:state] "
+                f"step={step} candidates=None rows={rows} "
+                f"shadow_states="
+                f"{[None if s is None else bool(s.is_terminated()) for s in shadows]}",
+                file=sys.stderr,
+                flush=True,
+            )
+        reqs = state.get("reqs") or ()
+        for index, token_set in enumerate(candidates or ()):
+            req = reqs[index % len(reqs)] if reqs else None
+            out_ids = list(getattr(req, "output_ids", ()) or ())
+            grammar = (state.get("grammars") or [None])[index % len(state["grammars"])]
+            accepted = list(getattr(grammar, "accepted_tokens", ()) or ())
+            print(
+                "[draftslice:state] "
+                f"row={index} out_len={len(out_ids)} "
+                f"last={out_ids[-4:]} "
+                f"grammar_len={len(accepted)} grammar_last={accepted[-4:]} "
+                f"count={0 if token_set is None else len(token_set)} "
+                f"ids={None if token_set is None else list(token_set.ids[:40])}",
+                file=sys.stderr,
+                flush=True,
+            )
     if candidates is None:
         _STATS["fallback_calls"] += 1
         _emit_contract(mode="full", reason="no_candidates")
@@ -615,6 +920,38 @@ def _patched_compute_lm_head(
             return _ORIGINAL_LM_HEAD(
                 self, hidden_states, lm_head, embedding_bias, out=out
             )
+        if _plan_enabled():
+            plan_result = _plan_step(
+                candidates,
+                policy_decision,
+                rows=rows,
+                vocab=global_vocab,
+                width=int(hidden_states.shape[1]),
+            )
+            if plan_result is None:
+                _STATS["fallback_calls"] += 1
+                _note_fallback("plan_compile_error")
+                _emit_contract(mode="full", reason="plan_compile_error")
+                return _ORIGINAL_LM_HEAD(
+                    self, hidden_states, lm_head, embedding_bias, out=out
+                )
+            if (
+                plan_result.action == "full"
+                and plan_result.scheduler_decision == "full"
+            ):
+                reason = plan_result.scheduler_reason or "full"
+                _STATS["fallback_calls"] += 1
+                _note_fallback(reason)
+                _emit_contract(
+                    mode="full",
+                    reason=reason,
+                    valid_sets=candidates,
+                    rows=rows,
+                    vocab_size=kernel_vocab,
+                )
+                return _ORIGINAL_LM_HEAD(
+                    self, hidden_states, lm_head, embedding_bias, out=out
+                )
 
     # _compute_lm_head returns rank-local logits; SGLang gathers them later.
     # A TP rank therefore slices its own shard with local row ids and returns
@@ -637,19 +974,45 @@ def _patched_compute_lm_head(
         return _ORIGINAL_LM_HEAD(self, subset, lm_head, embedding_bias, out=None)
 
     try:
-        logits, stats = build_draft_logits(
-            hidden_states,
-            weight[:kernel_vocab],
-            candidates,
-            vocab_size=kernel_vocab,
-            full_logits=full_logits,
-            max_slice_rows=config.max_rows,
-        )
+        if config.mask_only:
+            logits = full_logits(hidden_states)
+            logits = mask_logits_to_valid(
+                logits, candidates, vocab_size=kernel_vocab
+            )
+            stats = None
+        else:
+            logits, stats = build_draft_logits(
+                hidden_states,
+                weight[:kernel_vocab],
+                candidates,
+                vocab_size=kernel_vocab,
+                full_logits=full_logits,
+                max_slice_rows=config.max_rows,
+            )
     except Exception:
         _STATS["fallback_calls"] += 1
         _emit_contract(mode="full", reason="build_error")
         return _ORIGINAL_LM_HEAD(
             self, hidden_states, lm_head, embedding_bias, out=out
+        )
+    _advance_shadows(state, logits)
+    if os.environ.get("DRAFTSLICE_SGLANG_STATE_DEBUG") == "1":
+        import sys
+
+        full = full_logits(hidden_states)
+        masked_top = logits.argmax(dim=-1).tolist()
+        full_top = full.argmax(dim=-1).tolist()
+        inside = [
+            None if candidate is None else (int(token) in candidate.ids)
+            for token, candidate in zip(full_top, candidates, strict=False)
+        ]
+        print(
+            "[draftslice:top] "
+            f"masked_top={masked_top} full_top={full_top} "
+            f"same={masked_top == full_top} "
+            f"full_top_in_candidates={inside}",
+            file=sys.stderr,
+            flush=True,
         )
     state["sliced_calls"] = int(state.get("sliced_calls", 0)) + 1
     _STATS["sliced_calls"] += 1
@@ -683,6 +1046,7 @@ def _patched_draft(self: Any, batch: Any, *args: Any, **kwargs: Any) -> Any:
     if original is None:
         raise SglangIntegrationError("SGLang draft hook is not installed")
     config = config_from_env()
+    _STATS["eagle_steps"] += int(config.enabled)
     grammars = (
         [getattr(req, "grammar", None) for req in getattr(batch, "reqs", ())]
         if config.enabled and getattr(batch, "has_grammar", False)
@@ -704,9 +1068,35 @@ def _patched_draft(self: Any, batch: Any, *args: Any, **kwargs: Any) -> Any:
             file=sys.stderr,
             flush=True,
         )
+    shadows = None
+    if grammars:
+        spec_info = getattr(batch, "spec_info", None)
+        bonus = getattr(spec_info, "bonus_tokens", None)
+        try:
+            bonus_tokens = (
+                [int(token) for token in bonus.tolist()]
+                if bonus is not None
+                else []
+            )
+        except Exception:
+            bonus_tokens = []
+        shadows = []
+        for index, grammar in enumerate(grammars):
+            shadow = _fork_grammar_object(grammar)
+            # The LM-head call produces the token AFTER the target's bonus
+            # token. The scheduler grammar still points at the bonus, so the
+            # draft shadow must accept it before the first mask.
+            if shadow is not None and index < len(bonus_tokens):
+                try:
+                    shadow.accept_token(int(bonus_tokens[index]))
+                except Exception:
+                    shadow = None
+            shadows.append(shadow)
     state = (
         {
             "grammars": grammars,
+            "shadows": shadows,
+            "reqs": tuple(getattr(batch, "reqs", ()) or ()),
             "step": 0,
             "config": config,
             "topk": int(getattr(self, "topk", 1)),
@@ -723,10 +1113,43 @@ def _patched_draft(self: Any, batch: Any, *args: Any, **kwargs: Any) -> Any:
         _DRAFT_STATE.reset(token)
 
 
+def _patched_dflash_generation(
+    self: Any,
+    batch: Any,
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    """DFlash hook: same policy boundary, but the block has no exact position.
+
+    SGLang's DFlash drafts a linear block under one hidden-state pass. Block
+    position 0 is the target bonus token, and positions 1..k are proposed
+    together, so there is no per-position exact grammar state to slice (unlike
+    EAGLE/MTP step 0). The hook therefore stays on the engine's full head and
+    records the negative result instead of inventing a candidate set.
+    """
+
+    if _ORIGINAL_DFLASH is None:
+        raise SglangIntegrationError("SGLang DFlash hook is not installed")
+    config = config_from_env()
+    if not config.enabled:
+        return _ORIGINAL_DFLASH(self, batch, *args, **kwargs)
+    _STATS["dflash_steps"] += 1
+    _STATS["dflash_fallback_steps"] += 1
+    _STATS["dflash_reason"] = "dflash_no_exact_position"
+    _STATS["action"] = "builtin"
+    _STATS["cell_hit"] = False
+    _STATS["cell_id"] = None
+    # Emit a sampled contract so traces can distinguish "hook installed" from
+    # "hook never ran"; the actual generation path is untouched.
+    if _STATS["dflash_steps"] % 8 == 1:
+        _emit_contract(mode="full", reason="dflash_no_exact_position")
+    return _ORIGINAL_DFLASH(self, batch, *args, **kwargs)
+
+
 def install() -> None:
     """Install the SGLang draft/head hooks (idempotent)."""
 
-    global _PATCHED, _ORIGINAL_DRAFT, _ORIGINAL_LM_HEAD
+    global _PATCHED, _ORIGINAL_DRAFT, _ORIGINAL_LM_HEAD, _ORIGINAL_DFLASH
     if _PATCHED:
         return
     # Fail at startup, not on the first request, when a table/hash is bad.
@@ -748,6 +1171,13 @@ def install() -> None:
     _ORIGINAL_DRAFT = _ORIGINAL_DRAFTS.get(EagleDraftWorker)
     _ORIGINAL_LM_HEAD = LogitsProcessor._compute_lm_head
     LogitsProcessor._compute_lm_head = _patched_compute_lm_head
+    try:  # DFlash is optional; its hook is a measured negative by default.
+        from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+
+        _ORIGINAL_DFLASH = DFlashWorkerV2.forward_batch_generation
+        DFlashWorkerV2.forward_batch_generation = _patched_dflash_generation
+    except Exception:  # pragma: no cover - older/newer SGLang layout
+        _ORIGINAL_DFLASH = None
     _PATCHED = True
 
 

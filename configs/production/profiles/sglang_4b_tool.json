@@ -1,0 +1,62 @@
+{
+  "cells": [
+    {
+      "action": "strict_slice",
+      "batch_bucket": "1",
+      "enabled": false,
+      "engine": "sglang",
+      "expected_gain": 1.0,
+      "graph": "eager",
+      "k": 1,
+      "manifest_id": "p4-sglang-mtp-pending",
+      "measured_p99_ratio": 1.0,
+      "method": "draftslice_mtp",
+      "model": "Qwen3.5-4B",
+      "quant": "bf16",
+      "tp": 1,
+      "valid_bucket": "65-512",
+      "workload": "tool_call"
+    },
+    {
+      "action": "strict_slice",
+      "batch_bucket": "1",
+      "enabled": false,
+      "engine": "sglang",
+      "expected_gain": 1.0,
+      "graph": "eager",
+      "k": 1,
+      "manifest_id": "p4-sglang-eagle3-missing-checkpoint",
+      "measured_p99_ratio": 1.0,
+      "method": "draftslice_eagle3",
+      "model": "Qwen3.5-4B",
+      "quant": "bf16",
+      "tp": 1,
+      "valid_bucket": "65-512",
+      "workload": "tool_call"
+    },
+    {
+      "action": "strict_slice",
+      "batch_bucket": "1",
+      "enabled": false,
+      "engine": "sglang",
+      "expected_gain": 1.0,
+      "graph": "eager",
+      "k": 1,
+      "manifest_id": "p4-sglang-dflash-no-exact-position",
+      "measured_p99_ratio": 1.0,
+      "method": "draftslice_dflash",
+      "model": "Qwen3.5-4B",
+      "quant": "bf16",
+      "tp": 1,
+      "valid_bucket": "65-512",
+      "workload": "tool_call"
+    }
+  ],
+  "created": "2026-11-22T14:03:22Z",
+  "engine": "sglang",
+  "hash": "sha256:da1beecc78a286eebfeb3fb6fd1021fd09f21e3cc13bdc0c3dda056a25c76154",
+  "model": "Qwen3.5-4B",
+  "notes": "P4 SGLang cells are disabled until a same-run B4 gate clears; DFlash has no exact block position.",
+  "schema": "profiles/1",
+  "table_id": "sglang-4b-tool-p4"
+}
