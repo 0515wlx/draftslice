@@ -6,12 +6,22 @@ torch = pytest.importorskip("torch")
 
 from draftslice.integrations.sglang import (  # noqa: E402
     SglangIntegrationError,
+    _plan_enabled,
     config_from_env,
     register,
     screen_logits,
 )
 from draftslice.plan import TokenSet  # noqa: E402
 from draftslice.screen import StaticPolicy  # noqa: E402
+
+
+def test_plan_mode_defaults_off(monkeypatch) -> None:
+    monkeypatch.delenv("DRAFTSLICE_SGLANG_PLAN", raising=False)
+    assert not _plan_enabled()
+    monkeypatch.setenv("DRAFTSLICE_SGLANG_PLAN", "telemetry")
+    assert _plan_enabled()
+    monkeypatch.setenv("DRAFTSLICE_SGLANG_PLAN", "off")
+    assert not _plan_enabled()
 
 
 def test_config_from_env(monkeypatch) -> None:
@@ -382,12 +392,59 @@ def test_install_patches_the_engine_classes() -> None:
     sg.install()
     assert sg._PATCHED
     from sglang.srt.layers.logits_processor import LogitsProcessor
+    from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
     from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
     from sglang.srt.speculative.frozen_kv_mtp_worker_v2 import FrozenKVMTPDraftWorker
 
     assert EagleDraftWorker.draft is sg._patched_draft
     assert FrozenKVMTPDraftWorker.draft is sg._patched_draft
     assert LogitsProcessor._compute_lm_head is sg._patched_compute_lm_head
+    assert DFlashWorkerV2.forward_batch_generation is sg._patched_dflash_generation
+
+
+def test_dflash_hook_stays_full_and_records_the_negative(monkeypatch) -> None:
+    from draftslice.integrations import sglang as sg
+
+    monkeypatch.setenv("DRAFTSLICE_SGLANG", "1")
+    calls = {"n": 0}
+
+    def original(self, batch, *args, **kwargs):
+        calls["n"] += 1
+        return "full"
+
+    monkeypatch.setattr(sg, "_ORIGINAL_DFLASH", original)
+    before = sg._STATS["dflash_fallback_steps"]
+    out = sg._patched_dflash_generation(object(), object())
+    assert out == "full"
+    assert calls["n"] == 1
+    assert sg._STATS["dflash_fallback_steps"] == before + 1
+    assert sg._STATS["dflash_reason"] == "dflash_no_exact_position"
+    assert sg._STATS["action"] == "builtin"
+
+
+def test_plan_step_builds_and_caches_slice_plans() -> None:
+    from draftslice.integrations import sglang as sg
+    from draftslice.runtime.policy import PolicyDecision
+    from draftslice.runtime.reasons import FallbackReason
+
+    decision = PolicyDecision(
+        action="slice",
+        mode="strict",
+        profile_mode="enforce",
+        reason=FallbackReason.NO_CELL,
+        row_mask=(True,),
+    )
+    first = sg._plan_step(
+        [TokenSet([1, 2, 3])], decision, rows=1, vocab=64, width=8
+    )
+    second = sg._plan_step(
+        [TokenSet([1, 2, 3])], decision, rows=1, vocab=64, width=8
+    )
+    assert first is not None and second is not None
+    assert first.plan_cache_miss
+    assert second.plan_cache_hit
+    assert sg._STATS["plan_cache_hits"] >= 1
+    assert sg._STATS["plan_compile_us"] >= 0.0
 
 
 def test_plugin_entry_point_is_installed() -> None:

@@ -1,8 +1,19 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
-from draftslice.cost import A100, CostModel, CostModelError, get_profile
+from draftslice.cost import (
+    A100,
+    CalibratedCostModel,
+    CalibrationError,
+    CostCalibration,
+    CostModel,
+    CostModelError,
+    CostSample,
+    get_profile,
+)
 from draftslice.plan import (
     Execution,
     Guarantee,
@@ -112,3 +123,92 @@ def test_cost_model_validation() -> None:
         model.predict(full_plan(10), unique_rows=11)
     with pytest.raises(ValueError):
         CostModel(vocab_size=0, hidden_size=10)
+
+
+def _samples(kind: str, factor: float, count: int = 6) -> list[CostSample]:
+    return [
+        CostSample(
+            kind=kind,
+            batch=1 if kind == "slice_gemv" else 8,
+            rows=64 * (index + 1),
+            predicted_us=100.0 + 10 * index,
+            measured_us=(100.0 + 10 * index) * factor,
+        )
+        for index in range(count)
+    ]
+
+
+def test_calibration_fits_factors_and_passes_gate() -> None:
+    samples = _samples("slice_gemv", 1.5) + _samples("full", 0.8)
+    calibration = CostCalibration.fit(samples, holdout_fraction=0.0)
+    assert calibration.calibrated
+    assert calibration.factors["slice_gemv"] == pytest.approx(1.5)
+    assert calibration.factors["full"] == pytest.approx(0.8)
+    assert calibration.mape == pytest.approx(0.0)
+
+
+def test_calibration_rejects_calibrated_above_gate() -> None:
+    with pytest.raises(CalibrationError):
+        CostCalibration(
+            profile="a100",
+            factors={"default": 1.0},
+            mape=0.1,
+            holdout_mape=0.5,
+            calibrated=True,
+            gate=0.25,
+        )
+
+
+def test_calibrated_model_applies_kind_factor() -> None:
+    model = CostModel(vocab_size=10_000, hidden_size=100)
+    base = model.predict(slice_plan(100)).predicted_us["a100"]
+    calibration = CostCalibration(
+        profile="a100",
+        factors={"full": 1.0, "slice_gemv": 2.0, "slice_gemm": 2.0, "default": 2.0},
+        mape=0.1,
+        holdout_mape=0.1,
+        calibrated=True,
+    )
+    calibrated = CalibratedCostModel(
+        vocab_size=10_000, hidden_size=100, calibration=calibration
+    )
+    assert calibrated.calibrated
+    assert calibrated.predict(slice_plan(100)).predicted_us["a100"] == pytest.approx(
+        base * 2.0
+    )
+    assert not model.calibrated
+
+
+def test_calibration_rejects_bad_artifacts(tmp_path) -> None:
+    with pytest.raises(CalibrationError):
+        CostCalibration.fit([])
+    with pytest.raises(CalibrationError):
+        CostSample(
+            kind="bad", batch=1, rows=1, predicted_us=1.0, measured_us=1.0
+        )
+    calibration = CostCalibration.fit(
+        _samples("slice_gemv", 1.0) + _samples("full", 1.0), holdout_fraction=0.0
+    )
+    path = tmp_path / "calibration.json"
+    calibration.save(path)
+    loaded = CostCalibration.load(path)
+    assert loaded.digest() == calibration.digest()
+
+
+def test_bench_report_is_loadable_as_a_calibration(tmp_path) -> None:
+    calibration = CostCalibration.fit(
+        _samples("slice_gemv", 1.0) + _samples("full", 1.0), holdout_fraction=0.0
+    )
+    path = tmp_path / "cost_model.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema": "cost-bench/1",
+                "calibration": calibration.to_dict(),
+                "records": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    loaded = CostCalibration.load(path)
+    assert loaded.to_dict() == calibration.to_dict()

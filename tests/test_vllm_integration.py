@@ -7,6 +7,17 @@ vllm = pytest.importorskip("vllm")
 from draftslice.integrations import vllm as integration  # noqa: E402
 
 
+def test_plan_mode_defaults_off(monkeypatch) -> None:
+    from draftslice.integrations.vllm import _plan_enabled
+
+    monkeypatch.delenv("DRAFTSLICE_VLLM_PLAN", raising=False)
+    assert not _plan_enabled()
+    monkeypatch.setenv("DRAFTSLICE_VLLM_PLAN", "enforce")
+    assert _plan_enabled()
+    monkeypatch.setenv("DRAFTSLICE_VLLM_PLAN", "off")
+    assert not _plan_enabled()
+
+
 def test_register_is_idempotent_and_registers_methods() -> None:
     integration.register()
     integration.register()
@@ -537,3 +548,61 @@ def test_policy_enforce_masks_only_hitting_rows(monkeypatch) -> None:
     assert speculator._draftslice_stats.cell_hit
     assert speculator._draftslice_stats.action == "slice"
     assert speculator._draftslice_stats.policy_slice_steps == 1
+
+
+def test_plan_session_builds_vllm_step_plans(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    import torch
+
+    from draftslice.integrations import vllm as integration
+    from draftslice.plan import TokenSet
+    from draftslice.runtime.policy import PolicyDecision
+    from draftslice.runtime.reasons import FallbackReason
+
+    monkeypatch.delenv("DRAFTSLICE_COST_CALIBRATION", raising=False)
+
+    class Base:
+        def __init__(self) -> None:
+            self.vllm_config = SimpleNamespace(
+                model_config=SimpleNamespace(
+                    model="/models/Qwen3.5-4B",
+                    dtype=SimpleNamespace(name="bfloat16"),
+                    quantization=None,
+                ),
+                speculative_config=SimpleNamespace(method="draftslice_mtp"),
+                parallel_config=SimpleNamespace(tensor_parallel_size=1),
+            )
+
+    class Speculator(integration.DraftSliceSpeculatorMixin, Base):
+        pass
+
+    speculator = Speculator()
+    speculator.vocab_size = 64
+    speculator._draftslice_idx_mapping_np = [7, 8]
+    speculator._draftslice_stats = integration.DraftSliceVllmStats()
+    decision = PolicyDecision(
+        action="slice",
+        mode="strict",
+        profile_mode="enforce",
+        reason=FallbackReason.NO_CELL,
+        row_mask=(True, False),
+    )
+    hidden = torch.zeros(2, 8)
+    first = speculator._plan_step(
+        [TokenSet([1, 2, 3]), TokenSet([4, 5])], decision, hidden
+    )
+    second = speculator._plan_step(
+        [TokenSet([1, 2, 3]), TokenSet([4, 5])], decision, hidden
+    )
+    assert first is not None and second is not None
+    assert first.sliced_rows == 1 and first.full_rows == 1
+    assert second.plan_cache_hit
+    speculator._record_policy(
+        decision, rows=2, candidates=3, plan_result=second
+    )
+    stats = speculator.draftslice_stats()
+    assert stats["plan_cache_hit"]
+    assert stats["plan_cache_hits"] >= 1
+    assert stats["candidate_cache_hit"]
+    assert stats["scheduler_reason"] == "strict_slice"
