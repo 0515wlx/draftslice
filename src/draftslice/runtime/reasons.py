@@ -30,6 +30,8 @@ class FallbackReason(str, Enum):
     MODE_OFF = "mode_off"  # profile_mode=off
     MODE_OBSERVE = "mode_observe"  # profile_mode=observe executes built-in
     UNCALIBRATED_COST = "uncalibrated_cost"  # scheduler has no fitted cost model
+    COST_NOT_PROFITABLE = "cost_not_profitable"  # predicted slice is not cheaper
+    COVERAGE_MISMATCH = "coverage_mismatch"  # strict plan/union coverage failed
     MIXED_CELL_ACTIONS = "mixed_cell_actions"  # rows want different actions
 
     # --- capabilities -----------------------------------------------------
@@ -64,6 +66,7 @@ class FallbackReason(str, Enum):
     # --- execution --------------------------------------------------------
     BUILD_ERROR = "build_error"
     PLAN_COMPILE_ERROR = "plan_compile_error"
+    DFLASH_NO_EXACT_POSITION = "dflash_no_exact_position"
     UNKNOWN = "unknown"
 
     def __str__(self) -> str:  # pragma: no cover - trivial
@@ -169,6 +172,8 @@ _ACTIONS: dict[FallbackReason, str] = {
     FallbackReason.MODE_OFF: "builtin_full",
     FallbackReason.MODE_OBSERVE: "builtin_full",
     FallbackReason.UNCALIBRATED_COST: "builtin_full",
+    FallbackReason.COST_NOT_PROFITABLE: "builtin_full",
+    FallbackReason.COVERAGE_MISMATCH: "full_head",
     FallbackReason.MIXED_CELL_ACTIONS: "builtin_full",
     FallbackReason.NO_GRAMMAR_STATE: "full_head",
     FallbackReason.NO_VALID_SETS: "full_head",
@@ -197,6 +202,7 @@ _ACTIONS: dict[FallbackReason, str] = {
     FallbackReason.UNSUPPORTED_QUANT_SCHEME: "full_head",
     FallbackReason.BUILD_ERROR: "full_head",
     FallbackReason.PLAN_COMPILE_ERROR: "full_head",
+    FallbackReason.DFLASH_NO_EXACT_POSITION: "full_head",
     FallbackReason.UNKNOWN: "full_head",
 }
 

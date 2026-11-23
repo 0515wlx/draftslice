@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import threading
 from collections import OrderedDict
-from collections.abc import Iterable
+from collections.abc import Hashable, Iterable
 
 from ..plan.types import TokenSet
 from .plan_cache import CacheStats
@@ -24,7 +24,7 @@ class CandidateSetCache:
         if max_bytes <= 0:
             raise ValueError("max_bytes must be positive")
         self.max_bytes = max_bytes
-        self._items: OrderedDict[tuple[int, ...], tuple[TokenSet, int]] = OrderedDict()
+        self._items: OrderedDict[Hashable, tuple[TokenSet, int]] = OrderedDict()
         self._bytes = 0
         self._hits = 0
         self._misses = 0
@@ -37,7 +37,11 @@ class CandidateSetCache:
         return 64 + 4 * len(key) + 4 * len(tokens)
 
     def get(self, group_ids: Iterable[int]) -> TokenSet | None:
-        key = _group_key(group_ids)
+        return self.get_keyed(_group_key(group_ids))
+
+    def get_keyed(self, key: Hashable) -> TokenSet | None:
+        """Look up a candidate set by an opaque key (e.g. a token-set tuple)."""
+
         with self._lock:
             item = self._items.get(key)
             if item is None:
@@ -50,7 +54,13 @@ class CandidateSetCache:
 
     def put(self, group_ids: Iterable[int], tokens: TokenSet) -> None:
         key = _group_key(group_ids)
-        size = self._size(key, tokens)
+        self.put_keyed(key, tokens, size=self._size(key, tokens))
+
+    def put_keyed(
+        self, key: Hashable, tokens: TokenSet, *, size: int | None = None
+    ) -> None:
+        if size is None:
+            size = 128 + 4 * len(tokens)
         with self._lock:
             if size > self.max_bytes:
                 self._oversize += 1

@@ -309,6 +309,11 @@ class StepPlan:
         if self.kernel == "full":
             return
         for node in self.nodes:
+            # Full nodes read the whole head; only slice nodes must be covered
+            # by the shared union. A mixed batch is legal and is executed node by
+            # node.
+            if node.plan.execution.kind == "full":
+                continue
             if not node.plan.candidates.issubset(self.union_rows):
                 raise ValueError("step union does not cover a node's candidates")
         if self.kernel == "auto" and not self.nodes:

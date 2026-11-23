@@ -32,7 +32,21 @@ from .config import (  # noqa: E402
     SafetyConfig,
     ServerConfig,
 )
-from .executor import ExecutionResult, ReferenceExecutor  # noqa: E402
+from .executor import (  # noqa: E402
+    ExecutionResult,
+    ProductionExecutor,
+    ProductionExecutorError,
+    ProductionNodeResult,
+    ProductionResult,
+    ReferenceExecutor,
+)
+from .plan_session import (  # noqa: E402
+    PlanSession,
+    PlanSessionConfig,
+    PlanSessionError,
+    PlanSessionResult,
+    validate_strict_step,
+)
 from .policy import (  # noqa: E402
     PolicyDecision,
     PolicyError,
@@ -54,7 +68,7 @@ from .profile import (  # noqa: E402
     valid_bucket,
 )
 from .reasons import FallbackReason, fallback_reason, reason_code, reason_info  # noqa: E402
-from .scheduler import Schedule, Scheduler, StepContext  # noqa: E402
+from .scheduler import Schedule, Scheduler, StepContext, StepScheduler  # noqa: E402
 from .trace import (  # noqa: E402
     StepTrace,
     TraceCache,
@@ -81,6 +95,14 @@ __all__ = [
     "DraftHeadExecutor",
     "ExecutionResult",
     "FallbackReason",
+    "PlanSession",
+    "PlanSessionConfig",
+    "PlanSessionError",
+    "PlanSessionResult",
+    "ProductionExecutor",
+    "ProductionExecutorError",
+    "ProductionNodeResult",
+    "ProductionResult",
     "ProfileError",
     "ProfileHashError",
     "ProfileMatch",
@@ -98,6 +120,7 @@ __all__ = [
     "StaticAcceptanceModel",
     "StepContext",
     "StepFacts",
+    "StepScheduler",
     "StepTrace",
     "TraceCache",
     "TraceDecision",
@@ -116,5 +139,6 @@ __all__ = [
     "policy_from_env",
     "reason_code",
     "reason_info",
+    "validate_strict_step",
     "valid_bucket",
 ]

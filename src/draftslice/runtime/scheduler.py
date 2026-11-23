@@ -13,8 +13,9 @@ from typing import Any
 
 from ..cost.model import CostModel
 from ..cost.profiles import HardwareProfile
-from ..plan.types import PlanCost, StepPlan
+from ..plan.types import GuaranteeKind, PlanCost, StepPlan
 from .acceptance import AcceptanceEstimate, AcceptanceModel, TreeShape
+from .reasons import FallbackReason
 
 
 @dataclass(frozen=True, slots=True)
@@ -229,4 +230,108 @@ class Scheduler:
         return self.choose(cheapest, context, fallback=fallback)
 
 
-__all__ = ["Schedule", "Scheduler", "StepContext"]
+class StepScheduler:
+    """Production gate around :class:`Scheduler`.
+
+    A predicted latency may only select a slice when the cost model is
+    calibrated (``docs/production-architecture.md`` D4). Until then every step
+    defaults to the full head, even if a profile cell is enabled. This keeps the
+    cost model from becoming an unmeasured production switch.
+    """
+
+    def __init__(
+        self,
+        cost_model: CostModel,
+        *,
+        calibrated: bool | None = None,
+        acceptance_model: AcceptanceModel | None = None,
+        max_mape: float = 0.25,
+    ) -> None:
+        if not (0.0 < max_mape <= 1.0):
+            raise ValueError("max_mape must be in (0, 1]")
+        self.cost_model = cost_model
+        self.max_mape = max_mape
+        self.calibrated = (
+            bool(getattr(cost_model, "calibrated", False))
+            if calibrated is None
+            else bool(calibrated)
+        )
+        self.scheduler = Scheduler(cost_model, acceptance_model=acceptance_model)
+
+    def choose(
+        self,
+        primary: StepPlan,
+        fallback: StepPlan,
+        *,
+        context: StepContext | None = None,
+        cell: Any | None = None,
+    ) -> Schedule:
+        context = context or StepContext(batch=max(1, len(primary.nodes)))
+        if cell is not None and not bool(getattr(cell, "is_profitable", True)):
+            return self._full(fallback, context, FallbackReason.PROFILE_DISABLED)
+        if not self.calibrated:
+            return self._full(fallback, context, FallbackReason.UNCALIBRATED_COST)
+        if not _strict_covers(primary):
+            return self._full(fallback, context, FallbackReason.COVERAGE_MISMATCH)
+
+        schedule = self.scheduler.choose(primary, context, fallback=fallback)
+        chosen = schedule.step_plan
+        if chosen.kernel == "full" or any(
+            node.plan.execution.kind == "full" for node in chosen.nodes
+        ):
+            schedule.explanation["reason"] = FallbackReason.COST_NOT_PROFITABLE.value
+            return schedule
+        if not _strict_covers(chosen):
+            return self._full(fallback, context, FallbackReason.COVERAGE_MISMATCH)
+
+        slice_cost = self.scheduler._predict(chosen, context)[1]
+        full_cost = self.scheduler._predict(fallback, context)[1]
+        if slice_cost >= full_cost:
+            return self._full(
+                fallback,
+                context,
+                FallbackReason.COST_NOT_PROFITABLE,
+                primary_us=slice_cost,
+                full_us=full_cost,
+            )
+        schedule.explanation["reason"] = "cost_profitable"
+        schedule.explanation["slice_us"] = slice_cost
+        schedule.explanation["full_us"] = full_cost
+        return schedule
+
+    def _full(
+        self,
+        fallback: StepPlan,
+        context: StepContext,
+        reason: FallbackReason,
+        **extra: Any,
+    ) -> Schedule:
+        cost, predicted_us = self.scheduler._predict(fallback, context)
+        return Schedule(
+            step_plan=fallback,
+            cost=cost,
+            feasible=True,
+            explanation={
+                "decision": "full",
+                "reason": reason.value,
+                "predicted_us": predicted_us,
+                **extra,
+            },
+        )
+
+
+def _strict_covers(step: StepPlan) -> bool:
+    if step.kernel == "full":
+        return True
+    for node in step.nodes:
+        plan = node.plan
+        if plan.guarantee.kind is not GuaranteeKind.EXACT_VALID_SET:
+            continue
+        if not plan.execution.covers(plan.candidates):
+            return False
+        if not plan.candidates.issubset(step.union_rows):
+            return False
+    return True
+
+
+__all__ = ["Schedule", "Scheduler", "StepContext", "StepScheduler"]
