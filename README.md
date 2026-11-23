@@ -63,6 +63,15 @@ repository.
 > default profile table enables no B=8 cells. See
 > [docs/production-architecture.md](docs/production-architecture.md).
 
+> **Lean exact-candidate mode (2026-11-23):** `DRAFTSLICE_VLLM_LEAN=1` is an
+> opt-in throughput mode for eager, TP=1, bf16 MTP with structured traffic. On
+> the production chat/tool shape (Qwen3.5-4B, B=1, k=8) it measures **+6.1%**
+> over built-in MTP (127.03 → 134.76 tok/s, single server) with identical greedy
+> outputs. It caches device payloads, reuses the output buffer, and drops
+> per-step contracts/policy/plan from the hot path; an uncalibrated cost
+> artifact disables slicing at startup. See
+> [docs/lean-slice.md](docs/lean-slice.md).
+
 ## Scope
 
 - Draft-side LM head only; the target verifier stays exact.
@@ -236,6 +245,12 @@ Each milestone has a definition of done in
 - vLLM context-aware sparse LM head — <https://github.com/vllm-project/vllm/pull/67897>
 - Grammar-aware draft sampling in vLLM — <https://github.com/vllm-project/vllm/pull/47885>
 - CASD: contract-aware speculative decoding — <https://www.computer.org/csdl/proceedings-article/sse/2026/119800a290/2joOwwfu2Ji>
+
+## Writing
+
+- [The 6% that survived: exact draft-head slicing in a real serving stack](docs/blog/2026-11-when-grammar-aware-drafting-pays.md)
+  — why the 1.19× experiment was 1.00× in production, and which optimization
+  remained.
 
 ## Development environments
 

@@ -1,6 +1,36 @@
 # Changelog
 
-## Unreleased
+## Unreleased (2026-11-23)
+
+- Add the opt-in lean exact-candidate slice (`DRAFTSLICE_VLLM_LEAN=1`): cached
+  device candidate payloads keyed by the exact `(row, TokenSet)` mapping, width
+  buckets grouped across rows, a reused logits output buffer, one fused launch
+  per group, and no per-step contract/trace/policy/plan/screener work. Measured
+  on the production chat/tool shape (Qwen3.5-4B, B=1, k=8, eager, TP=1): 127.03
+  → 134.76 tok/s (**+6.1%**) with greedy-identical outputs and τ 7.33. The
+  design, 16.2% head share / 63% coverage accounting, gate semantics, and
+  limitations are in `docs/lean-slice.md`.
+- Fix the SGLang EAGLE draft grammar position: fork the request matcher and
+  accept `spec_info.bonus_tokens` before the first draft mask, so the mask
+  corresponds to the state after the target's verified bonus. Acceptance returns
+  from 2.300 to the built-in 3.286. Add the all-position shadow slice
+  (`DRAFTSLICE_SGLANG_ALLPOS=1`), the full-head+mask control
+  (`DRAFTSLICE_SGLANG_MASK_ONLY=1`), the per-position state diagnostics, and the
+  measured DFlash negative (`dflash_no_exact_position`).
+- Default `DRAFTSLICE_VLLM_PLAN` / `DRAFTSLICE_SGLANG_PLAN` to `off`. An
+  uncalibrated cost artifact now disables slicing at startup instead of paying
+  the shadow/fork tax and returning the full head per call; the gate
+  short-circuits before valid-set, shadow, policy, and plan work.
+- Add `StepScheduler` (calibrated-only gate with strict coverage and profitability
+  checks), `PlanSession`, `ProductionExecutor`, and `runtime/plan_session.py`.
+  The plan layer remains out of the production engine path; `PLAN=enforce` only
+  compiles/records plans until the executor drives logits.
+- Fix the B2 cost bench to use `unique_rows=rows` (the gather kernel reads each
+  row once) and make `CostCalibration.load` accept a `cost-bench/1` report.
+- Add `configs/production/` profile tables, `draftslice.bench.cost`, the SGLang
+  E2E runner, and tests for the lean logits, plan defaults, plan sessions,
+  production executor, DFlash hook, and loadable cost reports.
+
 
 - Add the experiment-converged production architecture. Routing experiments on
   Qwen3.5-4B/B8 show that a blanket structured DraftSlice profile is a
