@@ -251,6 +251,8 @@ Each milestone has a definition of done in
 - [The 6% that survived: exact draft-head slicing in a real serving stack](docs/blog/2026-11-when-grammar-aware-drafting-pays.md)
   — why the 1.19× experiment was 1.00× in production, and which optimization
   remained.
+- [从 1.19× 到 +6.1%：一次 draft 头切片的生产化复盘](https://0515wlx.github.io/posts/2026-11-draftslice-lean.html)
+  — 中文版复盘：请求形状、Amdahl、lean 路径、负面结果与剩余空间。
 
 ## Development environments
 
