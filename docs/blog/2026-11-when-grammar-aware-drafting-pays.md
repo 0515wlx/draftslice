@@ -210,7 +210,10 @@ DRAFTSLICE_VLLM=1 DRAFTSLICE_VLLM_SLICE=1 DRAFTSLICE_VLLM_LEAN=1 \
 The design note with the full accounting, gates, and limitations is
 [`docs/lean-slice.md`](../lean-slice.md). Raw JSON and the debugging reports are
 kept out of the published tree (they contain host paths); the tables above are
-the reproducible summary.
+the reproducible summary. Our independent measurements and the workload-shape /
+bonus-token caveats are also posted in the discussion on
+[vLLM #47885](https://github.com/vllm-project/vllm/pull/47885#issuecomment-7102276290);
+we deliberately did not open a competing feature PR.
 
 If you take one thing away: **the head is 16% of the step, and the exact
 candidate set is 63% of the head. Everything else is the cost of getting out of
