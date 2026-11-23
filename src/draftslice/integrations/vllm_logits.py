@@ -655,11 +655,146 @@ def build_draft_logits(
     )
 
 
+@dataclass(slots=True)
+class _LeanPayload:
+    """Device-resident payload for one width-bucket group of rows."""
+
+    token_sets: tuple[TokenSet, ...]
+    tokens: Any
+    rows: Any
+    width: int
+
+
+_LEAN_PAYLOADS: dict[tuple[Any, int, str], _LeanPayload] = {}
+_LEAN_PAYLOADS_MAX = 2048
+
+
+def clear_lean_payload_cache() -> None:
+    _LEAN_PAYLOADS.clear()
+
+
+def _lean_group_payload(
+    entries: tuple[tuple[int, TokenSet], ...],
+    width: int,
+    device: Any,
+) -> _LeanPayload:
+    """Padded candidate matrix + row indices for one width bucket.
+
+    Identical grammar states across batch rows are grouped into one launch and
+    one weight read (the plan layer's row dedup, without compiling a StepPlan).
+    The cache key is the exact ``(row, TokenSet identity)`` mapping, so a
+    permutation of the same states is a different payload but the same shape.
+    """
+
+    ordered = tuple(sorted(entries, key=lambda item: (id(item[1]), item[0])))
+    key = (tuple((row, id(token_set)) for row, token_set in ordered), int(width), str(device))
+    cached = _LEAN_PAYLOADS.get(key)
+    if cached is not None:
+        return cached
+    payload = np.full((len(ordered), width), -1, dtype=np.int32)
+    rows = np.empty(len(ordered), dtype=np.int32)
+    for index, (row, token_set) in enumerate(ordered):
+        ids_np = _token_index_np(token_set)
+        payload[index, : ids_np.size] = ids_np[:width]
+        rows[index] = row
+    entry = _LeanPayload(
+        token_sets=tuple(token_set for _, token_set in ordered),
+        tokens=_upload(payload, device),
+        rows=_upload(rows, device),
+        width=int(width),
+    )
+    _LEAN_PAYLOADS[key] = entry
+    while len(_LEAN_PAYLOADS) > _LEAN_PAYLOADS_MAX:
+        _LEAN_PAYLOADS.pop(next(iter(_LEAN_PAYLOADS)))
+    return entry
+
+
+def build_draft_logits_lean(
+    hidden_states: Any,
+    weight: Any,
+    valid_sets: Sequence[TokenSet | None],
+    *,
+    vocab_size: int,
+    full_logits: Callable[[Any], Any],
+    max_slice_rows: int,
+    scale: float = 1.0,
+    soft_cap: float | None = None,
+    out: Any = None,
+    kernel: Any = None,
+) -> tuple[Any, DraftSliceLogitsStats]:
+    """TP=1 lean path: cached candidate payloads and one launch per row.
+
+    Same output contract as :func:`build_draft_logits` (full ``[batch, vocab]``
+    with ``-inf`` outside the candidate set), but no bucket construction, no
+    per-call pinned payload, and an optional caller-reused output buffer.
+    """
+
+    if torch is None:
+        raise VllmLogitsError("torch is not installed")
+    rows = int(hidden_states.shape[0])
+    if len(valid_sets) != rows:
+        raise VllmLogitsError("valid_sets length does not match the batch")
+    if out is None:
+        out = torch.full(
+            (rows, vocab_size), float("-inf"), dtype=torch.float32,
+            device=hidden_states.device,
+        )
+    else:
+        out.fill_(float("-inf"))
+    kernel = kernel or _default_kernel()
+    if not getattr(kernel, "supports_rows_into", False):  # pragma: no cover
+        raise VllmLogitsError("lean path requires the fused slice kernel")
+    full_rows: list[int] = []
+    sliced_rows = 0
+    candidate_total = 0
+    groups: dict[int, list[tuple[int, TokenSet]]] = {}
+    for row, token_set in enumerate(valid_sets):
+        if (
+            token_set is None
+            or token_set.is_empty
+            or len(token_set) > max_slice_rows
+        ):
+            full_rows.append(row)
+            continue
+        width = candidate_bucket(len(token_set), max_count=max_slice_rows)
+        groups.setdefault(width, []).append((row, token_set))
+    for width, entries in groups.items():
+        payload = _lean_group_payload(tuple(entries), width, hidden_states.device)
+        kernel.run_rows_into(
+            hidden_states,
+            weight,
+            payload.tokens,
+            payload.rows,
+            out,
+            width=width,
+            scale=scale,
+            soft_cap=soft_cap,
+        )
+        sliced_rows += len(entries)
+        candidate_total += sum(len(token_set) for _, token_set in entries)
+    if full_rows:
+        idx = torch.as_tensor(full_rows, dtype=torch.int64, device=hidden_states.device)
+        out[idx] = full_logits(hidden_states.index_select(0, idx))[:, :vocab_size].float()
+    return out, DraftSliceLogitsStats(
+        rows=rows,
+        sliced_rows=sliced_rows,
+        full_rows=len(full_rows),
+        candidate_total=candidate_total,
+        distinct_sets=sliced_rows,
+        masked_full_rows=0,
+        agreed_full_rows=0,
+        replicated=True,
+        combined=False,
+    )
+
+
 __all__ = [
     "DraftSliceLogitsStats",
     "LogitsCombine",
     "PlanAgreement",
     "VllmLogitsError",
     "build_draft_logits",
+    "build_draft_logits_lean",
+    "clear_lean_payload_cache",
     "mask_logits_to_valid",
 ]

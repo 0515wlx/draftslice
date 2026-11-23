@@ -29,17 +29,26 @@ from typing import Any
 
 import numpy as np
 
+from ..cost import CalibratedCostModel, CostCalibration
 from ..plan.types import (
     DraftContract,
     Execution,
     Guarantee,
+    HeadPlan,
     ServingPoint,
     TokenSet,
 )
+from ..runtime.plan_session import (
+    PlanSession,
+    PlanSessionConfig,
+    PlanSessionResult,
+)
 from ..runtime.policy import PolicyDecision, RowFacts, StepFacts
 from ..runtime.profile import batch_bucket
+from ..runtime.scheduler import StepContext, StepScheduler
 from ..runtime.trace import (
     StepTrace,
+    TraceCache,
     TraceDecision,
     TraceIdentity,
     TraceRegistry,
@@ -70,6 +79,7 @@ from .vllm_grammar import (
 )
 from .vllm_logits import (
     build_draft_logits,
+    build_draft_logits_lean,
     mask_logits_to_valid,
     upload_numpy,
 )
@@ -146,6 +156,19 @@ class DraftSliceVllmStats:
     row_share: float = 0.0
     measured_head_share: float | None = None
     trace_count: int = 0
+    # Plan session (P2): compiler/candidate caches and scheduler gate.
+    plan_compile_us: float = 0.0
+    plan_compile_total_us: float = 0.0
+    plan_cache_hit: bool = False
+    plan_cache_miss: bool = False
+    candidate_cache_hit: bool = False
+    candidate_cache_miss: bool = False
+    plan_cache_hits: int = 0
+    plan_cache_misses: int = 0
+    candidate_cache_hits: int = 0
+    candidate_cache_misses: int = 0
+    scheduler_action: str = ""
+    scheduler_reason: str = ""
     # Actual per-step batch distribution (draft rows), as profile-table buckets.
     batch_buckets: dict[str, int] = field(default_factory=dict)
 
@@ -229,6 +252,18 @@ class DraftSliceVllmStats:
             "row_share": self.row_share,
             "measured_head_share": self.measured_head_share,
             "trace_count": self.trace_count,
+            "plan_compile_us": self.plan_compile_us,
+            "plan_compile_total_us": self.plan_compile_total_us,
+            "plan_cache_hit": self.plan_cache_hit,
+            "plan_cache_miss": self.plan_cache_miss,
+            "candidate_cache_hit": self.candidate_cache_hit,
+            "candidate_cache_miss": self.candidate_cache_miss,
+            "plan_cache_hits": self.plan_cache_hits,
+            "plan_cache_misses": self.plan_cache_misses,
+            "candidate_cache_hits": self.candidate_cache_hits,
+            "candidate_cache_misses": self.candidate_cache_misses,
+            "scheduler_action": self.scheduler_action,
+            "scheduler_reason": self.scheduler_reason,
             "batch_buckets": dict(self.batch_buckets),
             "quantized_head": self.quantized_head,
             "quantized_rows": self.quantized_rows,
@@ -239,6 +274,32 @@ class DraftSliceVllmStats:
 
 def _debug_on() -> bool:
     return os.environ.get("DRAFTSLICE_VLLM_DEBUG") == "1"
+
+
+def _plan_mode() -> str:
+    """How the plan session participates in the hot path.
+
+    ``off`` (default) keeps the direct slice path: the plan layer is not
+    compiled because neither adapter executes ``ProductionExecutor`` yet.
+    ``telemetry`` compiles/caches plans for stats only; ``enforce`` also lets
+    the cost scheduler force a full head. Use ``enforce`` only with a
+    calibrated artifact.
+    """
+
+    return os.environ.get("DRAFTSLICE_VLLM_PLAN", "off").strip().lower()
+
+
+def _plan_enabled() -> bool:
+    return _plan_mode() in ("1", "true", "telemetry", "enforce")
+
+
+def _lean_enabled() -> bool:
+    """Lean exact-candidate path: cached device payloads, no hot-path telemetry.
+
+    Eager, TP=1, unquantized, no policy/screener/plan only.
+    """
+
+    return os.environ.get("DRAFTSLICE_VLLM_LEAN") == "1"
 
 
 def _tp_debug(message: str) -> None:
@@ -548,6 +609,15 @@ class DraftSliceSpeculatorMixin:
     _draftslice_policy_hold: str | None = None
     _draftslice_traces: TraceRegistry | None = None
     _draftslice_trace_sampler: TraceSampler | None = None
+    _draftslice_plan_session: PlanSession | None = None
+    _draftslice_plan_key: tuple[int, int] | None = None
+    _draftslice_plan_scheduler: StepScheduler | None = None
+    _draftslice_lean = False
+    _draftslice_lean_out: Any | None = None
+    _draftslice_lean_key: tuple[int, int, str] | None = None
+    _draftslice_lean_gate: tuple[bool, str | None] | None = None
+    _draftslice_lean_decision: PolicyDecision | None = None
+    _draftslice_lean_cost_cache: dict[tuple[int, int], tuple[bool, str | None]] = {}
     _draftslice_screener: Any | None = None
     _draftslice_screener_config: ScreenerConfig | None = None
     _draftslice_idx_mapping_np: np.ndarray | None = None
@@ -621,6 +691,29 @@ class DraftSliceSpeculatorMixin:
         self._draftslice_policy_hold: str | None = None
         self._draftslice_traces = make_registry()
         self._draftslice_trace_sampler = TraceSampler(trace_sample_from_env())
+        self._draftslice_plan_session = None
+        self._draftslice_plan_key = None
+        self._draftslice_plan_scheduler = self._load_cost_scheduler()
+        if (
+            self._draftslice_plan_scheduler is not None
+            and not self._draftslice_plan_scheduler.calibrated
+        ):
+            # The gate is an artifact-level decision: an uncalibrated cost model
+            # must not even install the shadow/fork work. Disabling slicing at
+            # startup keeps the stock path byte-identical instead of paying the
+            # adapter tax only to return the full head every step.
+            self._draftslice_slicing = False
+            self._draftslice_stats.note_fallback("uncalibrated_cost")
+        self._draftslice_lean = bool(
+            _lean_enabled()
+            and _screener_config() is None
+            and not _plan_enabled()
+        )
+        self._draftslice_lean_out = None
+        self._draftslice_lean_key = None
+        self._draftslice_lean_gate = None
+        self._draftslice_lean_decision = None
+        self._draftslice_lean_cost_cache = {}
         self._draftslice_policy_identity = (
             self._policy_model_name() or "unknown",
             self._policy_method_name(),
@@ -717,7 +810,7 @@ class DraftSliceSpeculatorMixin:
             execution = Execution(
                 kind=execution_kind
                 or ("slice_gemm" if self._draftslice_shard is not None else "slice_gemv"),
-                rows=candidate_set,
+                rows=None if execution_kind == "full" else candidate_set,
             )
         source = "draftslice"
         if self._draftslice_shard is not None and self._draftslice_shard.tp_size > 1:
@@ -764,7 +857,8 @@ class DraftSliceSpeculatorMixin:
                 f"rows={int(hidden_states.shape[0])}"
             )
         self._draftslice_stats.record(sliced=False)
-        self._emit_contract(mode="full", valid_sets=valid_sets, reason=reason)
+        if not self._draftslice_lean:
+            self._emit_contract(mode="full", valid_sets=valid_sets, reason=reason)
         return base_compute(hidden_states, spec_step_idx)
 
     def _maybe_debug_stats(self) -> None:
@@ -1041,6 +1135,8 @@ class DraftSliceSpeculatorMixin:
         self._draftslice_call_index = 0
         self._draftslice_step = 0
         self._draftslice_spec_step = 0
+        self._draftslice_lean_gate = None
+        self._draftslice_lean_decision = None
         self._draftslice_req_by_state = {}
         self._draftslice_idx_mapping_np = None
         if self._draftslice_shadow is not None:
@@ -1464,6 +1560,171 @@ class DraftSliceSpeculatorMixin:
         self._draftslice_head_cache = (weight, shard)
         return weight, shard
 
+    # -- lean exact-candidate path ----------------------------------------
+    def _lean_ok(self) -> bool:
+        """Whether the lean hot path is valid for this step/engine."""
+
+        if not self._draftslice_lean or not self._draftslice_slicing:
+            return False
+        if self._draftslice_graph_replay or self._draftslice_block:
+            return False
+        shard = self._draftslice_shard
+        return shard is None or int(getattr(shard, "tp_size", 1)) == 1
+
+    def _lean_output(self, rows: int, vocab_size: int, device: Any) -> Any:
+        import torch
+
+        key = (int(rows), int(vocab_size), str(device))
+        if self._draftslice_lean_out is None or self._draftslice_lean_key != key:
+            self._draftslice_lean_out = torch.full(
+                (int(rows), int(vocab_size)),
+                float("-inf"),
+                dtype=torch.float32,
+                device=device,
+            )
+            self._draftslice_lean_key = key
+        return self._draftslice_lean_out
+
+    def _lean_cost_ok(self, valid_sets: Any) -> tuple[bool, str | None]:
+        """Calibrated cost gate without compiling a StepPlan.
+
+        The production gate compares predicted slice and full latency with
+        ``unique_rows=batch`` (the B2 reuse fix). Lean adds a calibrated
+        per-call adapter tax so a wide candidate set can fall back to full.
+        """
+
+        scheduler = self._draftslice_plan_scheduler
+        if scheduler is None:
+            return True, None
+        if not scheduler.calibrated:
+            return False, "uncalibrated_cost"
+        union = self._union_token_sets(valid_sets)
+        if union is None or not union.ids:
+            return False, "no_candidates"
+        rows = int(len(valid_sets))
+        key = (len(union), rows)
+        cached = self._draftslice_lean_cost_cache.get(key)
+        if cached is not None:
+            return cached
+        full_plan = HeadPlan(
+            candidates=union,
+            execution=Execution(kind="full"),
+            guarantee=Guarantee.full(),
+        )
+        slice_plan = HeadPlan(
+            candidates=union,
+            execution=Execution(kind="slice_gemv", rows=union),
+            guarantee=Guarantee.exact_valid_set(),
+        )
+        try:
+            model = scheduler.cost_model
+            vocab = int(getattr(model, "vocab_size", 0) or len(union))
+            full_us = min(
+                model.predict(
+                    full_plan, batch=rows, unique_rows=vocab, fused=True
+                ).predicted_us.values()
+            )
+            slice_us = min(
+                model.predict(
+                    slice_plan, batch=rows, unique_rows=len(union), fused=True
+                ).predicted_us.values()
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            self._draftslice_stats.record_error(f"lean cost gate: {exc}")
+            return False, "cost_gate_error"
+        tax_us = float(os.environ.get("DRAFTSLICE_VLLM_LEAN_TAX_US", "150") or 150.0)
+        allowed = slice_us + tax_us < full_us
+        result = (allowed, None if allowed else "cost_gate_full")
+        if len(self._draftslice_lean_cost_cache) > 256:
+            self._draftslice_lean_cost_cache.clear()
+        self._draftslice_lean_cost_cache[key] = result
+        return result
+
+    def _lean_allowed(self, valid_sets: Any) -> tuple[bool, str | None]:
+        """Per-step policy cell + cost gate for the lean path (cached)."""
+
+        if self._draftslice_lean_gate is not None:
+            return self._draftslice_lean_gate
+        adapter = self._draftslice_adapter_policy
+        if (
+            adapter is not None
+            and adapter.uses_table
+            and self._draftslice_lean_decision is None
+        ):
+            self._draftslice_lean_decision = self._decide_policy(
+                valid_sets, record=False
+            )
+        decision = self._draftslice_lean_decision
+        if decision is not None:
+            if not decision.executes_slice:
+                self._draftslice_lean_gate = (False, decision.reason.value)
+                return self._draftslice_lean_gate
+            if decision.action != "slice":
+                self._draftslice_lean_gate = (False, "lean_action_unsupported")
+                return self._draftslice_lean_gate
+        self._draftslice_lean_gate = self._lean_cost_ok(valid_sets)
+        return self._draftslice_lean_gate
+
+    def _compute_draft_logits_lean(
+        self,
+        hidden_states: Any,
+        spec_step_idx: int,
+        base_compute: Any,
+        fallback: Any,
+    ) -> Any:
+        valid_sets = self._valid_sets_for_rows(hidden_states)
+        if valid_sets is None or not any(token_set is not None for token_set in valid_sets):
+            self._draftslice_stats.no_valid_sets_calls += 1
+            return fallback("no_valid_sets")
+        allowed, reason = self._lean_allowed(valid_sets)
+        if not allowed:
+            return fallback(reason or "lean_gate")
+        decision = self._draftslice_lean_decision
+        if decision is not None and decision.row_mask:
+            valid_sets = [
+                token_set if hit else None
+                for token_set, hit in zip(valid_sets, decision.row_mask, strict=True)
+            ]
+            if not any(token_set is not None for token_set in valid_sets):
+                return fallback("lean_no_rows", valid_sets)
+        head_view = self._slice_head()
+        if head_view is None:
+            return fallback(None, valid_sets)
+        weight, shard = head_view
+        if shard is not None and int(getattr(shard, "tp_size", 1)) != 1:
+            return fallback("lean_tp_unsupported", valid_sets)
+        if is_quantized_weight(weight):
+            return fallback("lean_quant_unsupported", valid_sets)
+        scale, soft_cap, supported = self._logits_postprocess()
+        if not supported:
+            return fallback("unsupported_logits_postprocess", valid_sets)
+        vocab_size = int(getattr(self, "vocab_size", 0) or 0)
+        if vocab_size <= 0:
+            return fallback("invalid_vocab_size", valid_sets)
+        out = self._lean_output(
+            int(hidden_states.shape[0]), vocab_size, hidden_states.device
+        )
+        logits, stats = build_draft_logits_lean(
+            hidden_states,
+            weight,
+            valid_sets,
+            vocab_size=vocab_size,
+            full_logits=lambda rows: base_compute(rows, spec_step_idx),
+            max_slice_rows=_max_slice_rows(vocab_size),
+            scale=scale,
+            soft_cap=soft_cap,
+            out=out,
+        )
+        self._draftslice_stats.calls += 1
+        self._draftslice_stats.sliced_calls += stats.sliced_rows
+        self._draftslice_stats.sliced_rows += stats.sliced_rows
+        self._draftslice_stats.full_rows += stats.full_rows
+        self._draftslice_stats.candidate_total += stats.candidate_total
+        self._draftslice_stats.row_share = compute_row_share(
+            stats.candidate_total, stats.sliced_rows, vocab_size
+        )
+        return logits
+
     # -- production policy -------------------------------------------------
     def _policy_allows_work(self) -> bool:
         """Observe/off/disabled-only must not pay shadow bookkeeping."""
@@ -1517,7 +1778,9 @@ class DraftSliceSpeculatorMixin:
             return list(workloads[:rows])
         return ["structured"] * rows
 
-    def _decide_policy(self, valid_sets: Any) -> PolicyDecision | None:
+    def _decide_policy(
+        self, valid_sets: Any, *, record: bool = True
+    ) -> PolicyDecision | None:
         adapter = self._draftslice_adapter_policy
         if adapter is None or adapter.policy is None:
             return None
@@ -1570,18 +1833,112 @@ class DraftSliceSpeculatorMixin:
                 f"rows={[(row.workload, row.valid_size) for row in rows][:4]} "
                 f"-> {decision.to_dict()}"
             )
-        self._record_policy(
-            decision,
-            rows=len(rows),
-            candidates=sum(
-                row.valid_size for row, hit in zip(rows, decision.row_mask, strict=True)
-                if hit
-            ),
-        )
+        if record:
+            self._record_policy(
+                decision,
+                rows=len(rows),
+                candidates=sum(
+                    row.valid_size
+                    for row, hit in zip(rows, decision.row_mask, strict=True)
+                    if hit
+                ),
+            )
         return decision
 
+    def _load_cost_scheduler(self, hidden_size: int = 0) -> StepScheduler | None:
+        """Load an optional calibrated cost model; uncalibrated models stay full."""
+
+        path = os.environ.get("DRAFTSLICE_COST_CALIBRATION", "").strip()
+        if not path:
+            return None
+        hsize = int(hidden_size or self._policy_hidden_size())
+        vocab = int(getattr(self, "vocab_size", 0) or 0)
+        if hsize <= 0 or vocab <= 0:
+            return None
+        try:
+            calibration = CostCalibration.load(path)
+            model = CalibratedCostModel(
+                vocab_size=vocab,
+                hidden_size=hsize,
+                calibration=calibration,
+            )
+            return StepScheduler(model)
+        except Exception as exc:  # a bad artifact is a hard config error
+            raise VllmIntegrationError(
+                f"cannot load DRAFTSLICE_COST_CALIBRATION: {exc}"
+            ) from exc
+
+    def _policy_hidden_size(self) -> int:
+        model_config = getattr(getattr(self, "vllm_config", None), "model_config", None)
+        for owner in (
+            model_config,
+            getattr(model_config, "hf_config", None),
+            getattr(getattr(model_config, "hf_config", None), "text_config", None),
+        ):
+            value = getattr(owner, "hidden_size", None)
+            if value:
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    continue
+        return int(getattr(self, "hidden_size", 0) or 0)
+
+    def _plan_session_for(self, hidden_states: Any) -> PlanSession | None:
+        vocab = int(getattr(self, "vocab_size", 0) or 0)
+        width = int(getattr(hidden_states, "shape", (0, 0))[1])
+        if vocab <= 0 or width <= 0:
+            return None
+        key = (vocab, width)
+        if self._draftslice_plan_session is not None and self._draftslice_plan_key == key:
+            return self._draftslice_plan_session
+        if self._draftslice_plan_scheduler is None:
+            self._draftslice_plan_scheduler = self._load_cost_scheduler(width)
+        self._draftslice_plan_session = PlanSession(
+            PlanSessionConfig(
+                vocab_size=vocab,
+                hidden_size=width,
+                max_rows=_max_slice_rows(vocab),
+            ),
+            scheduler=self._draftslice_plan_scheduler,
+        )
+        self._draftslice_plan_key = key
+        return self._draftslice_plan_session
+
+    def _plan_step(
+        self,
+        valid_sets: Any,
+        decision: PolicyDecision,
+        hidden_states: Any,
+    ) -> PlanSessionResult | None:
+        session = self._plan_session_for(hidden_states)
+        if session is None:
+            return None
+        state_ids: list[int | None] = []
+        mapping = self._draftslice_idx_mapping_np
+        if mapping is not None:
+            state_ids = [int(state) for state in mapping[: len(valid_sets)]]
+        if len(state_ids) < len(valid_sets):
+            state_ids.extend([None] * (len(valid_sets) - len(state_ids)))
+        try:
+            return session.build(
+                valid_sets,
+                state_ids=state_ids,
+                action=decision.action,
+                row_mask=decision.row_mask,
+                context=StepContext(batch=max(1, len(valid_sets))),
+                cell=decision.cell,
+            )
+        except Exception as exc:
+            self._draftslice_stats.record_error(f"plan_session: {exc}")
+            return None
+
     def _record_policy(
-        self, decision: PolicyDecision, *, rows: int = 0, candidates: int = 0
+        self,
+        decision: PolicyDecision,
+        *,
+        rows: int = 0,
+        candidates: int = 0,
+        plan_result: PlanSessionResult | None = None,
     ) -> None:
         stats = self._draftslice_stats
         self._draftslice_policy_decision = decision
@@ -1589,6 +1946,34 @@ class DraftSliceSpeculatorMixin:
         stats.cell_id = decision.cell_id
         stats.cell_hit = decision.cell_hit
         stats.action = decision.action
+        timing = TraceTiming()
+        cache = TraceCache()
+        if plan_result is not None:
+            stats.plan_compile_us = plan_result.plan_compile_us
+            stats.plan_compile_total_us += plan_result.plan_compile_us
+            stats.plan_cache_hit = plan_result.plan_cache_hit
+            stats.plan_cache_miss = plan_result.plan_cache_miss
+            stats.candidate_cache_hit = plan_result.candidate_cache_hit
+            stats.candidate_cache_miss = plan_result.candidate_cache_miss
+            stats.plan_cache_hits = int(
+                plan_result.explanation.get("plan_cache_hits", 0) or 0
+            )
+            stats.plan_cache_misses = int(
+                plan_result.explanation.get("plan_cache_misses", 0) or 0
+            )
+            stats.candidate_cache_hits = int(
+                plan_result.explanation.get("candidate_cache_hits", 0) or 0
+            )
+            stats.candidate_cache_misses = int(
+                plan_result.explanation.get("candidate_cache_misses", 0) or 0
+            )
+            stats.scheduler_action = plan_result.scheduler_decision
+            stats.scheduler_reason = plan_result.scheduler_reason
+            timing = TraceTiming(plan_compile_us=plan_result.plan_compile_us)
+            cache = TraceCache(
+                plan_hit=plan_result.plan_cache_hit,
+                candidate_hit=plan_result.candidate_cache_hit,
+            )
         if decision.executes_slice:
             stats.policy_slice_steps += 1
         else:
@@ -1631,7 +2016,8 @@ class DraftSliceSpeculatorMixin:
                             1.0, float(candidates) / float(max(1, rows) * vocab)
                         ),
                     ),
-                    timing=TraceTiming(),
+                    timing=timing,
+                    cache=cache,
                 )
             )
             stats.trace_count = self._draftslice_traces.recorded
@@ -2031,6 +2417,17 @@ class DraftSliceSpeculatorMixin:
         if self._draftslice_policy_hold is not None:
             # observe/off: stock path, no valid-set or shadow work at all.
             return fallback(self._draftslice_policy_hold)
+        if self._lean_ok():
+            return self._compute_draft_logits_lean(
+                hidden_states, spec_step_idx, base_compute, fallback
+            )
+        if (
+            self._draftslice_plan_scheduler is not None
+            and not self._draftslice_plan_scheduler.calibrated
+        ):
+            # The gate is authoritative: do not build valid sets, advance the
+            # shadow, evaluate the policy, or compile a plan only to discard it.
+            return fallback("uncalibrated_cost")
         if self._draftslice_block and _block_allpos_enabled():
             allpos = self._compute_block_allpos(hidden_states, spec_step_idx, base_compute)
             if allpos is not None:
@@ -2085,17 +2482,56 @@ class DraftSliceSpeculatorMixin:
             if not any(token_set is not None for token_set in valid_sets):
                 return fallback("screener_empty", valid_sets)
 
-        policy_decision = self._decide_policy(valid_sets)
+        policy_decision = self._decide_policy(valid_sets, record=False)
         contract_mode: str | None = None
         if policy_decision is not None:
+            policy_rows = len(valid_sets)
+            policy_candidates = sum(
+                len(token_set)
+                for token_set, hit in zip(
+                    valid_sets, policy_decision.row_mask, strict=True
+                )
+                if hit and token_set is not None
+            )
             if not policy_decision.executes_slice:
+                self._record_policy(
+                    policy_decision,
+                    rows=policy_rows,
+                    candidates=policy_candidates,
+                )
                 return fallback(policy_decision.reason.value, valid_sets)
             if policy_decision.action == "mask_allpos" and not self._draftslice_block:
+                self._record_policy(
+                    policy_decision,
+                    rows=policy_rows,
+                    candidates=policy_candidates,
+                )
                 return fallback("capability_unsupported", valid_sets)
             # Only rows with an enabled exact cell keep their valid set; the
             # rest use the full head inside the same batch.
             valid_sets = filter_valid_sets(valid_sets, policy_decision.row_mask)
             contract_mode = policy_decision.mode
+            plan_result = None
+            if _plan_enabled():
+                plan_result = self._plan_step(
+                    valid_sets, policy_decision, hidden_states
+                )
+            self._record_policy(
+                policy_decision,
+                rows=policy_rows,
+                candidates=policy_candidates,
+                plan_result=plan_result,
+            )
+            if _plan_enabled():
+                if plan_result is None:
+                    return fallback("plan_compile_error", valid_sets)
+                if (
+                    plan_result.action == "full"
+                    and plan_result.scheduler_decision == "full"
+                ):
+                    return fallback(
+                        plan_result.scheduler_reason or "full", valid_sets
+                    )
 
         if _full_mask_enabled() or (
             policy_decision is not None and policy_decision.action == "mask"
